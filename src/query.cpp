@@ -1,6 +1,7 @@
 #include "navigamer/query.hpp"
 
 #include <algorithm>
+#include <chrono>
 #include <cstdlib>
 #include <limits>
 #include <stdexcept>
@@ -13,19 +14,34 @@ namespace navigamer {
 std::vector<QueryHit> QueryEngine::query(std::string_view sequence,
                                          const QueryConfig& config,
                                          QueryStats* stats,
-                                         PathCache* path_cache) const {
+                                         PathCache* path_cache,
+                                         QueryStageTimings* timings) const {
+  using Clock = std::chrono::steady_clock;
+  const auto total_start = Clock::now();
   if (sequence.empty()) throw std::invalid_argument("query sequence is empty");
   QueryStats local_stats;
+  QueryStageTimings local_timings;
+  local_timings.layer_routing_ns.assign(index_.layers.size(), 0);
   const auto calls_at_start = distance_.calls();
+  auto prepared_query = distance_.prepare(sequence);
   std::unordered_map<SequenceId, int> exact_distance_cache;
   exact_distance_cache.reserve(128);
 
-  auto exact_to_reference = [&](SequenceId id, std::uint64_t& category) {
+  auto elapsed_ns = [](Clock::time_point start) {
+    return static_cast<std::uint64_t>(
+        std::chrono::duration_cast<std::chrono::nanoseconds>(
+            Clock::now() - start).count());
+  };
+
+  auto exact_to_reference = [&](SequenceId id, std::uint64_t& category,
+                                std::uint64_t& category_ns) {
     if (const auto found = exact_distance_cache.find(id);
         found != exact_distance_cache.end()) {
       return found->second;
     }
-    const int d = distance_(sequence, reference_.sequence(id));
+    const auto start = Clock::now();
+    const int d = prepared_query(reference_.sequence(id));
+    category_ns += elapsed_ns(start);
     ++category;
     exact_distance_cache.emplace(id, d);
     return d;
@@ -35,13 +51,17 @@ std::vector<QueryHit> QueryEngine::query(std::string_view sequence,
         found != exact_distance_cache.end()) {
       return found->second <= static_cast<int>(bound) ? found->second : -1;
     }
+    const auto start = Clock::now();
     const int d = distance_(sequence, reference_.sequence(id),
                             static_cast<int>(bound));
+    local_timings.leaf_verification_edlib_ns += elapsed_ns(start);
     ++local_stats.leaf_verification_edlib_calls;
     if (d >= 0) exact_distance_cache.emplace(id, d);
     return d;
   };
+  local_timings.setup_ns = elapsed_ns(total_start);
 
+  const auto anchor_start = Clock::now();
   int root_anchor_query_distance = -1;
   if (config.enable_path_cache && path_cache &&
       config.anchor_refresh_interval != 0) {
@@ -56,7 +76,8 @@ std::vector<QueryHit> QueryEngine::query(std::string_view sequence,
         const auto child = index_.children[root.first_child + ordinal];
         const auto center = index_.nodes[child].center_sequence_id;
         const int d = exact_to_reference(
-            center, local_stats.query_anchor_edlib_calls);
+            center, local_stats.query_anchor_edlib_calls,
+            local_timings.query_anchor_edlib_ns);
         if (d < 0 || d >= kMissingDistance) {
           throw std::length_error("query-anchor distance exceeds uint16");
         }
@@ -67,11 +88,14 @@ std::vector<QueryHit> QueryEngine::query(std::string_view sequence,
       path_cache->root_anchor_age = 0;
       root_anchor_query_distance = 0;
     } else {
+      const auto start = Clock::now();
       root_anchor_query_distance = distance_(
           sequence, path_cache->root_anchor_query);
+      local_timings.query_anchor_edlib_ns += elapsed_ns(start);
       ++local_stats.query_anchor_edlib_calls;
     }
   }
+  local_timings.anchor_ns = elapsed_ns(anchor_start);
 
   // A previous path is only an upper-bound hint. Its center distance is always
   // recomputed for the current query and the exact metric search still proves
@@ -106,7 +130,12 @@ std::vector<QueryHit> QueryEngine::query(std::string_view sequence,
         cached_ordinal = static_cast<std::uint32_t>(found - first);
         cached_query_distance = exact_to_reference(
             index_.nodes[cached_child].center_sequence_id,
-            center_edlib_calls);
+            center_edlib_calls,
+            parent_id == index_.root
+                ? local_timings.top_center_edlib_ns
+                : parent.layer == 0
+                ? local_timings.middle_center_edlib_ns
+                : local_timings.leaf_center_edlib_ns);
         ++local_stats.world_center_distances;
         used_cached_hint = true;
       }
@@ -116,7 +145,7 @@ std::vector<QueryHit> QueryEngine::query(std::string_view sequence,
     for (std::uint32_t beacon = 0; beacon < parent.beacon_count; ++beacon) {
       query_beacon_distances[beacon] = exact_to_reference(
           index_.beacons[parent.first_beacon + beacon],
-          local_stats.beacon_edlib_calls);
+          local_stats.beacon_edlib_calls, local_timings.beacon_edlib_ns);
     }
 
     // A large root cannot afford an all-pairs matrix. Materialize exactly one
@@ -128,19 +157,44 @@ std::vector<QueryHit> QueryEngine::query(std::string_view sequence,
     int root_path_pivot_query_distance = 0;
     if (parent_id == index_.root &&
         index_.dense_pair_offsets[parent_id] == kNoNode &&
-        cache_applicable && path_cache) {
-      for (auto it = path_cache->contained_path.rbegin();
-           it != path_cache->contained_path.rend(); ++it) {
-        if (*it != kNoNode && *it < index_.nodes.size()) {
-          root_path_pivot = *it;
-          break;
+        config.enable_path_pivot && cache_applicable && path_cache) {
+      // Reusing a still-proximal row avoids rebuilding one distance to every
+      // top-world center whenever a source-sorted query crosses a small-world
+      // boundary. Any pivot gives a valid reverse-triangle lower bound; the
+      // distance threshold controls efficiency only, never correctness.
+      if (path_cache->root_path_pivot != kNoNode &&
+          path_cache->root_path_pivot < index_.nodes.size() &&
+          path_cache->root_path_pivot_center_distances.size() ==
+              parent.child_count) {
+        const auto retained = path_cache->root_path_pivot;
+        const int retained_distance = exact_to_reference(
+            index_.nodes[retained].center_sequence_id,
+            local_stats.path_pivot_query_edlib_calls,
+            local_timings.path_pivot_query_edlib_ns);
+        ++local_stats.world_center_distances;
+        if (retained_distance <=
+            static_cast<int>(config.path_pivot_max_distance)) {
+          root_path_pivot = retained;
+          root_path_pivot_query_distance = retained_distance;
+        }
+      }
+      if (root_path_pivot == kNoNode) {
+        for (auto it = path_cache->contained_path.rbegin();
+             it != path_cache->contained_path.rend(); ++it) {
+          if (*it != kNoNode && *it < index_.nodes.size()) {
+            root_path_pivot = *it;
+            break;
+          }
         }
       }
     }
-    if (root_path_pivot != kNoNode) {
+    if (root_path_pivot != kNoNode && root_path_pivot_query_distance == 0 &&
+        sequence != reference_.sequence(
+            index_.nodes[root_path_pivot].center_sequence_id)) {
       root_path_pivot_query_distance = exact_to_reference(
           index_.nodes[root_path_pivot].center_sequence_id,
-          local_stats.path_pivot_query_edlib_calls);
+          local_stats.path_pivot_query_edlib_calls,
+          local_timings.path_pivot_query_edlib_ns);
       ++local_stats.world_center_distances;
     }
     if (parent_id == index_.root && root_path_pivot != kNoNode &&
@@ -152,11 +206,13 @@ std::vector<QueryHit> QueryEngine::query(std::string_view sequence,
       path_cache->root_path_pivot_center_distances.resize(parent.child_count);
       const auto pivot_center =
           index_.nodes[root_path_pivot].center_sequence_id;
+      auto prepared_pivot = distance_.prepare(reference_.sequence(pivot_center));
       for (std::uint32_t ordinal = 0; ordinal < parent.child_count; ++ordinal) {
         const auto child = index_.children[parent.first_child + ordinal];
         const auto center = index_.nodes[child].center_sequence_id;
-        const int d = distance_(reference_.sequence(pivot_center),
-                                reference_.sequence(center));
+        const auto start = Clock::now();
+        const int d = prepared_pivot(reference_.sequence(center));
+        local_timings.path_pivot_row_edlib_ns += elapsed_ns(start);
         ++local_stats.path_pivot_row_edlib_calls;
         if (d < 0 || d >= kMissingDistance) {
           throw std::length_error("path-pivot distance exceeds uint16");
@@ -189,7 +245,12 @@ std::vector<QueryHit> QueryEngine::query(std::string_view sequence,
               (kDensePivots - 1));
           const auto child = index_.children[parent.first_child + ordinal];
           dense_pivots.push_back({ordinal, exact_to_reference(
-              index_.nodes[child].center_sequence_id, center_edlib_calls)});
+              index_.nodes[child].center_sequence_id, center_edlib_calls,
+              parent_id == index_.root
+                  ? local_timings.top_center_edlib_ns
+                  : parent.layer == 0
+                  ? local_timings.middle_center_edlib_ns
+                  : local_timings.leaf_center_edlib_ns)});
           ++local_stats.world_center_distances;
         }
       }
@@ -243,7 +304,12 @@ std::vector<QueryHit> QueryEngine::query(std::string_view sequence,
           continue;
         }
         const int d = exact_to_reference(child.center_sequence_id,
-                                         center_edlib_calls);
+                                         center_edlib_calls,
+                                         parent_id == index_.root
+                                             ? local_timings.top_center_edlib_ns
+                                             : parent.layer == 0
+                                             ? local_timings.middle_center_edlib_ns
+                                             : local_timings.leaf_center_edlib_ns);
         ++local_stats.world_center_distances;
         ++local_stats.worlds_considered;
         if (d <= intersection_bound) result.push_back({child_id, d});
@@ -281,7 +347,12 @@ std::vector<QueryHit> QueryEngine::query(std::string_view sequence,
         }
 
         const int d = exact_to_reference(child.center_sequence_id,
-                                         center_edlib_calls);
+                                         center_edlib_calls,
+                                         parent_id == index_.root
+                                             ? local_timings.top_center_edlib_ns
+                                             : parent.layer == 0
+                                             ? local_timings.middle_center_edlib_ns
+                                             : local_timings.leaf_center_edlib_ns);
         ++local_stats.worlds_considered;
         ++local_stats.world_center_distances;
         if (d <= static_cast<int>(child.cover_radius) +
@@ -344,7 +415,12 @@ std::vector<QueryHit> QueryEngine::query(std::string_view sequence,
         best_child = cached_child;
         best_distance = exact_to_reference(
             index_.nodes[cached_child].center_sequence_id,
-            center_edlib_calls);
+            center_edlib_calls,
+            parent_id == index_.root
+                ? local_timings.top_center_edlib_ns
+                : parent.layer == 0
+                ? local_timings.middle_center_edlib_ns
+                : local_timings.leaf_center_edlib_ns);
         cached_query_distance = best_distance;
         cached_ordinal = static_cast<std::uint32_t>(found - first);
         ++local_stats.world_center_distances;
@@ -360,7 +436,7 @@ std::vector<QueryHit> QueryEngine::query(std::string_view sequence,
       for (std::uint32_t beacon = 0; beacon < parent.beacon_count; ++beacon) {
         query_beacon_distances[beacon] = exact_to_reference(
             index_.beacons[parent.first_beacon + beacon],
-            local_stats.beacon_edlib_calls);
+            local_stats.beacon_edlib_calls, local_timings.beacon_edlib_ns);
       }
       struct DensePivot {
         std::uint32_t ordinal{0};
@@ -377,7 +453,12 @@ std::vector<QueryHit> QueryEngine::query(std::string_view sequence,
               (kDensePivots - 1));
           const auto child = index_.children[parent.first_child + ordinal];
           dense_pivots.push_back({ordinal, exact_to_reference(
-              index_.nodes[child].center_sequence_id, center_edlib_calls)});
+              index_.nodes[child].center_sequence_id, center_edlib_calls,
+              parent_id == index_.root
+                  ? local_timings.top_center_edlib_ns
+                  : parent.layer == 0
+                  ? local_timings.middle_center_edlib_ns
+                  : local_timings.leaf_center_edlib_ns)});
           ++local_stats.world_center_distances;
         }
       }
@@ -424,7 +505,12 @@ std::vector<QueryHit> QueryEngine::query(std::string_view sequence,
         }
         const auto child_id = index_.children[child_slot];
         const int d = exact_to_reference(
-            index_.nodes[child_id].center_sequence_id, center_edlib_calls);
+            index_.nodes[child_id].center_sequence_id, center_edlib_calls,
+            parent_id == index_.root
+                ? local_timings.top_center_edlib_ns
+                : parent.layer == 0
+                ? local_timings.middle_center_edlib_ns
+                : local_timings.leaf_center_edlib_ns);
         ++local_stats.world_center_distances;
         ++local_stats.worlds_considered;
         visited.push_back({child_id, d});
@@ -473,7 +559,12 @@ std::vector<QueryHit> QueryEngine::query(std::string_view sequence,
       const auto& metric_node = index_.metric_nodes[metric_id];
       const auto child_id = index_.children[metric_node.child_slot];
       const int d = exact_to_reference(
-          index_.nodes[child_id].center_sequence_id, center_edlib_calls);
+          index_.nodes[child_id].center_sequence_id, center_edlib_calls,
+          parent_id == index_.root
+              ? local_timings.top_center_edlib_ns
+              : parent.layer == 0
+              ? local_timings.middle_center_edlib_ns
+              : local_timings.leaf_center_edlib_ns);
       ++local_stats.worlds_considered;
       ++local_stats.world_center_distances;
       visited.push_back({child_id, d});
@@ -541,6 +632,7 @@ std::vector<QueryHit> QueryEngine::query(std::string_view sequence,
   std::vector<NodeId> current{index_.root};
   std::vector<NodeId> new_path(index_.layers.size(), kNoNode);
   for (std::size_t depth = 0; depth < index_.layers.size(); ++depth) {
+    const auto layer_start = Clock::now();
     const NodeId cached_child = cache_applicable &&
             depth < path_cache->contained_path.size()
         ? path_cache->contained_path[depth]
@@ -562,6 +654,7 @@ std::vector<QueryHit> QueryEngine::query(std::string_view sequence,
         candidates.end());
     if (candidates.empty()) {
       current.clear();
+      local_timings.layer_routing_ns[depth] = elapsed_ns(layer_start);
       break;
     }
     const auto nearest = std::min_element(candidates.begin(), candidates.end(),
@@ -573,8 +666,10 @@ std::vector<QueryHit> QueryEngine::query(std::string_view sequence,
     current.clear();
     current.reserve(candidates.size());
     for (const auto candidate : candidates) current.push_back(candidate.node);
+    local_timings.layer_routing_ns[depth] = elapsed_ns(layer_start);
   }
 
+  const auto leaf_scan_start = Clock::now();
   std::vector<QueryHit> hits;
   std::unordered_set<SequenceId> verified;
   for (const auto leaf_id : current) {
@@ -584,7 +679,8 @@ std::vector<QueryHit> QueryEngine::query(std::string_view sequence,
     for (std::uint32_t beacon = 0; beacon < leaf.beacon_count; ++beacon) {
       query_beacon_distances[beacon] =
           exact_to_reference(index_.beacons[leaf.first_beacon + beacon],
-                             local_stats.beacon_edlib_calls);
+                             local_stats.beacon_edlib_calls,
+                             local_timings.beacon_edlib_ns);
     }
     for (std::uint32_t ordinal = 0; ordinal < leaf.child_count; ++ordinal) {
       ++local_stats.leaf_members_considered;
@@ -615,7 +711,9 @@ std::vector<QueryHit> QueryEngine::query(std::string_view sequence,
             [](const QueryHit& lhs, const QueryHit& rhs) {
               return lhs.sequence_id < rhs.sequence_id;
             });
+  local_timings.leaf_scan_ns = elapsed_ns(leaf_scan_start);
 
+  const auto cache_update_start = Clock::now();
   if (path_cache) {
     path_cache->previous_query.assign(sequence);
     path_cache->contained_path = std::move(new_path);
@@ -624,6 +722,8 @@ std::vector<QueryHit> QueryEngine::query(std::string_view sequence,
       ++path_cache->root_anchor_age;
     }
   }
+  local_timings.cache_update_ns = elapsed_ns(cache_update_start);
+  const auto accounting_start = Clock::now();
   local_stats.edit_distance_calls = distance_.calls() - calls_at_start;
   const auto categorized_calls =
       local_stats.top_center_edlib_calls +
@@ -640,6 +740,9 @@ std::vector<QueryHit> QueryEngine::query(std::string_view sequence,
   local_stats.uncategorized_edlib_calls =
       local_stats.edit_distance_calls - categorized_calls;
   if (stats) *stats = local_stats;
+  local_timings.accounting_ns = elapsed_ns(accounting_start);
+  local_timings.total_ns = elapsed_ns(total_start);
+  if (timings) *timings = std::move(local_timings);
   return hits;
 }
 

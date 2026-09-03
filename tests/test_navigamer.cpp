@@ -148,6 +148,20 @@ void edit_distance_test() {
   require(distance("ACGT", "ACGT") == 0, "identity distance failed");
   require(distance("ACGT", "AGT") == 1, "deletion distance failed");
   require(distance("ACGT", "TTTT", 2) == -1, "bounded distance failed");
+
+  std::mt19937_64 random(0x4e61766967614d65ULL);
+  static constexpr char alphabet[] = "ACGTN";
+  for (std::size_t trial = 0; trial < 2000; ++trial) {
+    const auto query_length = 1 + random() % 220;
+    const auto target_length = 1 + random() % 220;
+    std::string query(query_length, 'A');
+    std::string target(target_length, 'A');
+    for (auto& base : query) base = alphabet[random() % 5];
+    for (auto& base : target) base = alphabet[random() % 5];
+    const auto prepared = distance.prepare(query);
+    require(prepared(target) == distance(query, target),
+            "prepared Myers distance differs from Edlib");
+  }
 }
 
 void sliding_window_property_test() {
@@ -168,6 +182,7 @@ void sliding_window_property_test() {
   build_config.threads = 4;
   build_config.delayed_centers = true;
   build_config.exact_global_reuse = false;
+  build_config.top_fill_radius = 10;
   auto index = IndexBuilder(reference).build(build_config);
   QueryEngine engine(index, reference);
   QueryConfig query_config{3, 5, true};

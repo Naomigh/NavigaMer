@@ -36,9 +36,10 @@ and builds the three default world layers.
   --output reference.nvm \
   --window 150 \
   --stride 1 \
-  --radii 65,35,15 \
-  --build-mode nested \
+  --radii 90,55,30 \
+  --build-mode topdown \
   --local-creation \
+  --top-fill-radius 75 \
   --beacons 4 \
   --threads 16 \
   --stats-output build_stats.tsv
@@ -50,9 +51,10 @@ Build options:
 |---|---:|---|
 | `--window N` | `150` | Reference-window length |
 | `--stride N` | `1` | Distance between consecutive windows |
-| `--radii A,B,C` | `65,35,15` | World radii, coarse to fine |
-| `--build-mode nested\|owner` | `nested` | Hierarchy construction mode |
+| `--radii A,B,C` | `90,55,30` | Tuned 150 bp E. coli world radii, coarse to fine |
+| `--build-mode topdown\|nested\|owner` | `topdown` | Hierarchy construction mode |
 | `--local-creation` | off | Use the cache-local incremental build mode |
+| `--top-fill-radius N` | `0` | Cap the actual occupied radius of top worlds; `0` uses the nominal top radius |
 | `--beacons N` | `4` | Maximum beacons per world |
 | `--hot-cache N` | `16` | Recent worlds retained by local creation |
 | `--threads N` | online CPUs | Worker count |
@@ -63,7 +65,7 @@ Build options:
 ## Inspect an index
 
 ```bash
-./build/navigamer inspect --index reference.nvm
+./build/navigamer inspect --index reference.nvm --worlds-output worlds.tsv
 ```
 
 ## Query an index
@@ -94,7 +96,9 @@ Query options:
 | `--threads N` | online CPUs | Worker count |
 | `--both-strands` | off | Query the forward and reverse-complement strands |
 | `--no-cache` | off | Disable the query path cache |
-| `--anchor-refresh N` | `8` | Root-anchor refresh interval; `0` disables it |
+| `--no-path-pivot` | off | Disable the dynamic exact root-pivot row (diagnostics) |
+| `--path-pivot-max-distance N` | `16` | Reuse a root-pivot row while its exact query distance is at most N |
+| `--anchor-refresh N` | `0` | Experimental root-anchor refresh interval; `0` avoids redundant rows |
 | `--block-size N` | `64` | Consecutive queries assigned per work block |
 | `--limit N` | unlimited | Query at most N records |
 | `--output FILE` | stdout | Write hits as TSV |

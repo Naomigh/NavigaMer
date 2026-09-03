@@ -76,13 +76,12 @@ CenterSelection select_centers(const SequenceStore& sequences,
 
   for (std::size_t ordinal = 0; ordinal < items.size(); ++ordinal) {
     const auto sequence_id = items[ordinal];
+    auto prepared = distance.prepare(sequences.sequence(sequence_id));
     bool covered = false;
     std::uint32_t covering = 0;
     for (const auto local_id : hot) {
-      const int d = distance(sequences.sequence(sequence_id),
-                             sequences.sequence(result.centers[local_id]),
-                             static_cast<int>(radius));
-      if (d >= 0) {
+      const int d = prepared(sequences.sequence(result.centers[local_id]));
+      if (d <= static_cast<int>(radius)) {
         covered = true;
         covering = local_id;
         break;
@@ -101,8 +100,7 @@ CenterSelection select_centers(const SequenceStore& sequences,
             std::min<std::size_t>(items.size() - 1, ordinal + lookahead);
         const auto candidate = items[candidate_ordinal];
         const bool covers_trigger =
-            distance(sequences.sequence(sequence_id),
-                     sequences.sequence(candidate), static_cast<int>(radius)) >= 0;
+            prepared(sequences.sequence(candidate)) <= static_cast<int>(radius);
         std::uint32_t ignored = 0;
         const bool separated = !exact_global_reuse || result.directory->empty() ||
             !result.directory->any_within(candidate, radius, &ignored);
@@ -233,6 +231,7 @@ std::vector<TemporaryWorld> pack_frozen_worlds(
   for (std::uint32_t child_local = 0; child_local < children.size();
        ++child_local) {
     auto& child = children[child_local];
+    auto prepared = distance.prepare(sequences.sequence(child.center));
     if (child.cover_radius > parent_radius) {
       throw std::logic_error("child occupied ball exceeds parent radius");
     }
@@ -241,10 +240,8 @@ std::vector<TemporaryWorld> pack_frozen_worlds(
     std::uint32_t parent_local = 0;
     int center_distance = -1;
     for (const auto candidate : hot) {
-      const int d = distance(sequences.sequence(child.center),
-                             sequences.sequence(parents[candidate].center),
-                             static_cast<int>(center_slack));
-      if (d >= 0) {
+      const int d = prepared(sequences.sequence(parents[candidate].center));
+      if (d <= static_cast<int>(center_slack)) {
         contained = true;
         parent_local = candidate;
         center_distance = d;
@@ -299,6 +296,167 @@ std::vector<TemporaryWorld> pack_frozen_worlds(
   return parents;
 }
 
+// Top-down construction first creates candidate centers at every radius. This
+// repair pass then gives every occupied child ball exactly one containing
+// parent. Candidate parents that never receive a child disappear, while a
+// child with no containing candidate promotes its own center into the parent
+// layer. The active-parent directory and hot deque prefer already-used worlds,
+// which keeps both the number of worlds and the number of physical edges low.
+std::vector<TemporaryWorld> repair_parent_layer(
+    const SequenceStore& sequences, const EditDistance& distance,
+    std::vector<SequenceId> candidate_centers,
+    std::vector<TemporaryWorld>& children, std::uint32_t parent_radius,
+    std::uint32_t hot_cache_size, bool exact_global_reuse) {
+  if (candidate_centers.empty() || children.empty()) {
+    throw std::logic_error("top-down repair received an empty layer");
+  }
+
+  const auto initial_candidate_count = candidate_centers.size();
+  std::unique_ptr<MetricTree> candidates;
+  std::unique_ptr<MetricTree> active;
+  if (exact_global_reuse) {
+    candidates = std::make_unique<MetricTree>(sequences, distance);
+    active = std::make_unique<MetricTree>(sequences, distance);
+    for (std::uint32_t candidate = 0; candidate < candidate_centers.size();
+         ++candidate) {
+      candidates->insert(candidate_centers[candidate], candidate);
+    }
+  }
+  std::vector<std::uint32_t> candidate_to_parent(
+      candidate_centers.size(), std::numeric_limits<std::uint32_t>::max());
+  std::deque<std::uint32_t> hot_candidates;
+  std::vector<TemporaryWorld> parents;
+
+  auto activate = [&](std::uint32_t candidate) {
+    if (candidate >= candidate_centers.size()) {
+      throw std::logic_error("top-down repair candidate is out of range");
+    }
+    auto& mapped = candidate_to_parent[candidate];
+    if (mapped != std::numeric_limits<std::uint32_t>::max()) return mapped;
+    if (parents.size() >=
+        static_cast<std::size_t>(std::numeric_limits<std::uint32_t>::max())) {
+      throw std::length_error("one repaired layer exceeds 2^32 worlds");
+    }
+    mapped = static_cast<std::uint32_t>(parents.size());
+    TemporaryWorld parent;
+    parent.center = candidate_centers[candidate];
+    parents.push_back(std::move(parent));
+    if (exact_global_reuse) {
+      active->insert(candidate_centers[candidate], candidate);
+    }
+    return mapped;
+  };
+
+  auto touch_hot = [&](std::uint32_t candidate) {
+    if (hot_cache_size == 0) return;
+    const auto found = std::find(
+        hot_candidates.begin(), hot_candidates.end(), candidate);
+    if (found != hot_candidates.end()) hot_candidates.erase(found);
+    hot_candidates.push_front(candidate);
+    while (hot_candidates.size() > hot_cache_size) hot_candidates.pop_back();
+  };
+
+  for (std::uint32_t child_local = 0; child_local < children.size();
+       ++child_local) {
+    auto& child = children[child_local];
+    auto prepared = distance.prepare(sequences.sequence(child.center));
+    if (child.cover_radius > parent_radius) {
+      throw std::logic_error("child occupied ball exceeds repaired parent radius");
+    }
+    const auto slack = parent_radius - child.cover_radius;
+    std::uint32_t candidate = std::numeric_limits<std::uint32_t>::max();
+    int center_distance = -1;
+
+    for (const auto hot : hot_candidates) {
+      const int d = prepared(sequences.sequence(candidate_centers[hot]));
+      if (d <= static_cast<int>(slack)) {
+        candidate = hot;
+        center_distance = d;
+        break;
+      }
+    }
+
+    if (candidate == std::numeric_limits<std::uint32_t>::max() &&
+        exact_global_reuse && !active->empty() &&
+        active->any_within(child.center, slack, &candidate)) {
+      center_distance = distance(
+          sequences.sequence(child.center),
+          sequences.sequence(candidate_centers[candidate]),
+          static_cast<int>(slack));
+      if (center_distance < 0) {
+        throw std::logic_error("active directory returned invalid containment");
+      }
+    }
+
+    if (candidate == std::numeric_limits<std::uint32_t>::max() &&
+        exact_global_reuse &&
+        candidates->any_within(child.center, slack, &candidate)) {
+      center_distance = distance(
+          sequences.sequence(child.center),
+          sequences.sequence(candidate_centers[candidate]),
+          static_cast<int>(slack));
+      if (center_distance < 0) {
+        throw std::logic_error("candidate directory returned invalid containment");
+      }
+    }
+
+    // The scalable local mode checks the candidate centers nearest in scan
+    // order. A miss only promotes the child center, so it can create a
+    // redundant parent but can never lose containment or a reference member.
+    if (candidate == std::numeric_limits<std::uint32_t>::max() &&
+        !exact_global_reuse) {
+      const auto initial_end = candidate_centers.begin() +
+          static_cast<std::ptrdiff_t>(initial_candidate_count);
+      const auto position = std::lower_bound(
+          candidate_centers.begin(), initial_end, child.center);
+      const auto ordinal = static_cast<std::size_t>(
+          position - candidate_centers.begin());
+      const auto neighborhood = std::max<std::size_t>(1, hot_cache_size);
+      const auto begin = ordinal > neighborhood ? ordinal - neighborhood : 0;
+      const auto end = std::min(initial_candidate_count,
+                                ordinal + neighborhood + 1);
+      for (std::size_t local = begin; local < end; ++local) {
+        const int d = prepared(sequences.sequence(candidate_centers[local]));
+        if (d <= static_cast<int>(slack)) {
+          candidate = static_cast<std::uint32_t>(local);
+          center_distance = d;
+          break;
+        }
+      }
+    }
+
+    if (candidate == std::numeric_limits<std::uint32_t>::max()) {
+      if (candidate_centers.size() >=
+          static_cast<std::size_t>(std::numeric_limits<std::uint32_t>::max())) {
+        throw std::length_error("top-down promoted layer exceeds 2^32 worlds");
+      }
+      candidate = static_cast<std::uint32_t>(candidate_centers.size());
+      candidate_centers.push_back(child.center);
+      candidate_to_parent.push_back(
+          std::numeric_limits<std::uint32_t>::max());
+      if (exact_global_reuse) candidates->insert(child.center, candidate);
+      center_distance = 0;
+    }
+
+    const auto parent_local = activate(candidate);
+    auto& parent = parents[parent_local];
+    const auto occupied_radius = static_cast<std::uint32_t>(center_distance) +
+                                 child.cover_radius;
+    if (occupied_radius > parent_radius || occupied_radius >= kMissingDistance) {
+      throw std::logic_error("repaired child ball is not contained by parent");
+    }
+    parent.cover_radius = std::max(
+        parent.cover_radius, static_cast<std::uint16_t>(occupied_radius));
+    parent.member_count += child.member_count;
+    parent.child_worlds.push_back(child_local);
+    child.parent_local = parent_local;
+    touch_hot(candidate);
+  }
+
+  if (parents.empty()) throw std::logic_error("top-down repair made no parents");
+  return parents;
+}
+
 struct LocalMetricNode {
   std::uint64_t child_slot{0};
   std::vector<std::pair<std::uint16_t, std::uint32_t>> edges;
@@ -326,13 +484,13 @@ void build_persistent_metric_tree(NavigaMerIndex& index, NodeId parent_id,
     const auto slot = slots[ordinal];
     const auto child = index.children[slot];
     const auto center = index.nodes[child].center_sequence_id;
+    auto prepared = distance.prepare(sequences.sequence(center));
     std::uint32_t current = 0;
     std::vector<std::pair<std::uint32_t, std::uint32_t>> ancestors;
     while (true) {
       const auto current_child = index.children[local[current].child_slot];
       const auto current_center = index.nodes[current_child].center_sequence_id;
-      const int d = distance(sequences.sequence(center),
-                             sequences.sequence(current_center));
+      const int d = prepared(sequences.sequence(current_center));
       if (d < 0 || d >= kMissingDistance) {
         throw std::length_error("metric-directory distance exceeds uint16");
       }
@@ -401,11 +559,11 @@ void build_dense_pair_matrix(NavigaMerIndex& index, NodeId parent_id,
     for (std::uint64_t row = begin; row < end; ++row) {
       const auto row_child = index.children[parent.first_child + row];
       const auto row_center = index.nodes[row_child].center_sequence_id;
+      auto prepared = distance.prepare(sequences.sequence(row_center));
       for (std::uint64_t column = 0; column < count; ++column) {
         const auto column_child = index.children[parent.first_child + column];
         const auto column_center = index.nodes[column_child].center_sequence_id;
-        const int d = distance(sequences.sequence(row_center),
-                               sequences.sequence(column_center));
+        const int d = prepared(sequences.sequence(column_center));
         if (d < 0 || d >= std::numeric_limits<std::uint8_t>::max()) {
           throw std::length_error("dense center distance exceeds uint8 capacity");
         }
@@ -445,8 +603,15 @@ NavigaMerIndex IndexBuilder::build(const BuildConfig& input_config,
       throw std::invalid_argument("radii must be strictly decreasing");
     }
   }
-  if (config.max_beacons > 64) {
-    throw std::invalid_argument("max_beacons above 64 is unsupported");
+  if (config.top_fill_radius != 0 &&
+      (config.top_fill_radius > config.radii.front() ||
+       (config.radii.size() > 1 &&
+        config.top_fill_radius < config.radii[1]))) {
+    throw std::invalid_argument(
+        "top fill radius must be between the top and second-layer radii");
+  }
+  if (config.max_beacons > std::numeric_limits<std::uint8_t>::max()) {
+    throw std::invalid_argument("max_beacons above 255 is unsupported");
   }
 
   distance_.reset_calls();
@@ -457,7 +622,63 @@ NavigaMerIndex IndexBuilder::build(const BuildConfig& input_config,
   std::vector<SequenceId> all_sequences(sequences_.size());
   std::iota(all_sequences.begin(), all_sequences.end(), SequenceId{0});
 
-  if (config.mode == BuildMode::kNestedBalls) {
+  if (config.mode == BuildMode::kTopDownNested) {
+    const auto leaf = config.radii.size() - 1;
+    std::vector<std::vector<SequenceId>> candidate_centers(
+        config.radii.size());
+    CenterSelection leaf_selection;
+    const auto center_start = Clock::now();
+    std::vector<std::future<CenterSelection>> selections;
+    selections.reserve(config.radii.size());
+    for (std::size_t layer = 0; layer < config.radii.size(); ++layer) {
+      selections.push_back(std::async(std::launch::async, [&, layer] {
+        return select_centers(
+            sequences_, distance_, all_sequences, config.radii[layer],
+            config.hot_cache_size, false, config.exact_global_reuse);
+      }));
+    }
+    for (std::size_t layer = 0; layer < config.radii.size(); ++layer) {
+      auto selection = selections[layer].get();
+      if (layer == leaf) {
+        leaf_selection = std::move(selection);
+      } else {
+        candidate_centers[layer] = std::move(selection.centers);
+      }
+    }
+    center_seconds = std::chrono::duration<double>(
+        Clock::now() - center_start).count();
+
+    const auto owner_start = Clock::now();
+    auto partition = assign_online_owners(
+        sequences_, distance_, all_sequences, std::move(leaf_selection),
+        config.radii[leaf], config.threads);
+    owner_seconds = std::chrono::duration<double>(
+        Clock::now() - owner_start).count();
+    temporary[leaf].reserve(partition.centers.size());
+    for (std::size_t child = 0; child < partition.centers.size(); ++child) {
+      TemporaryWorld world;
+      world.center = partition.centers[child];
+      world.member_count = partition.members[child].size();
+      world.cover_radius = partition.cover_radii[child];
+      world.members = std::move(partition.members[child]);
+      temporary[leaf].push_back(std::move(world));
+    }
+
+    const auto repair_start = Clock::now();
+    for (std::size_t child_layer = leaf; child_layer > 0; --child_layer) {
+      const auto parent_layer = child_layer - 1;
+      const auto fill_radius = parent_layer == 0 &&
+              config.top_fill_radius != 0
+          ? config.top_fill_radius
+          : config.radii[parent_layer];
+      temporary[child_layer - 1] = repair_parent_layer(
+          sequences_, distance_, std::move(candidate_centers[child_layer - 1]),
+          temporary[child_layer], fill_radius,
+          config.hot_cache_size, config.exact_global_reuse);
+    }
+    packing_seconds = std::chrono::duration<double>(
+        Clock::now() - repair_start).count();
+  } else if (config.mode == BuildMode::kNestedBalls) {
     const auto leaf = config.radii.size() - 1;
     const auto center_start = Clock::now();
     auto selection = select_centers(
@@ -574,7 +795,8 @@ NavigaMerIndex IndexBuilder::build(const BuildConfig& input_config,
   index.window_length = sequences_.window_length();
   index.stride = sequences_.stride();
   index.max_beacons = config.max_beacons;
-  index.routing_mode = config.mode == BuildMode::kNestedBalls
+  index.routing_mode = config.mode == BuildMode::kNestedBalls ||
+          config.mode == BuildMode::kTopDownNested
       ? RoutingMode::kNestedBalls
       : RoutingMode::kNearestOwner;
   index.reference_count = sequences_.size();
@@ -645,16 +867,42 @@ NavigaMerIndex IndexBuilder::build(const BuildConfig& input_config,
     if (node.child_count == 0) continue;
     const auto wanted = std::min(config.max_beacons, node.child_count);
     std::unordered_set<SequenceId> seen;
-    for (std::uint32_t beacon_ordinal = 0; beacon_ordinal < wanted;
-         ++beacon_ordinal) {
+    auto child_sequence_at = [&](std::uint64_t ordinal) {
+      const auto child = index.children[node.first_child + ordinal];
+      return index.is_terminal(node)
+          ? static_cast<SequenceId>(child)
+          : index.nodes[child].center_sequence_id;
+    };
+    // A world's own center is the cheapest and usually the most proximal
+    // local beacon: routing has normally calculated d(Q, center) already.
+    // Put it first so the per-query exact-distance cache turns this constraint
+    // into an O(1) lookup before evaluating more distant beacons.
+    if (node.center_sequence_id != kNoSequence) {
+      for (std::uint32_t ordinal = 0; ordinal < node.child_count; ++ordinal) {
+        if (child_sequence_at(ordinal) == node.center_sequence_id) {
+          seen.insert(node.center_sequence_id);
+          index.beacons.push_back(node.center_sequence_id);
+          break;
+        }
+      }
+    }
+    for (std::uint32_t sample = 0;
+         index.beacons.size() - node.first_beacon < wanted && sample < wanted;
+         ++sample) {
       const std::uint64_t ordinal = wanted == 1
           ? 0
-          : static_cast<std::uint64_t>(beacon_ordinal) * (node.child_count - 1) /
+          : static_cast<std::uint64_t>(sample) * (node.child_count - 1) /
                 (wanted - 1);
-      const auto child = index.children[node.first_child + ordinal];
-      const SequenceId beacon = index.is_terminal(node)
-          ? child
-          : index.nodes[child].center_sequence_id;
+      const auto beacon = child_sequence_at(ordinal);
+      if (seen.insert(beacon).second) index.beacons.push_back(beacon);
+    }
+    // Duplicate centers can make a stratified slot collide. Fill any remaining
+    // beacon slots in child order; this is construction-only and exact.
+    for (std::uint32_t ordinal = 0;
+         index.beacons.size() - node.first_beacon < wanted &&
+             ordinal < node.child_count;
+         ++ordinal) {
+      const auto beacon = child_sequence_at(ordinal);
       if (seen.insert(beacon).second) index.beacons.push_back(beacon);
     }
     node.beacon_count = static_cast<std::uint8_t>(
@@ -674,11 +922,11 @@ NavigaMerIndex IndexBuilder::build(const BuildConfig& input_config,
         const SequenceId child_sequence = index.is_terminal(node)
             ? child
             : index.nodes[child].center_sequence_id;
+        auto prepared = distance_.prepare(sequences_.sequence(child_sequence));
         for (std::uint32_t beacon_ordinal = 0;
              beacon_ordinal < node.beacon_count; ++beacon_ordinal) {
           const auto beacon = index.beacons[node.first_beacon + beacon_ordinal];
-          const int d = distance_(sequences_.sequence(child_sequence),
-                                  sequences_.sequence(beacon));
+          const int d = prepared(sequences_.sequence(beacon));
           if (d < 0 || d >= kMissingDistance) {
             throw std::length_error("beacon distance exceeds uint16 capacity");
           }

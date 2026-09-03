@@ -12,14 +12,18 @@ namespace navigamer {
 enum class BuildMode : std::uint32_t {
   kNearestOwner = 0,
   kNestedBalls = 1,
+  kTopDownNested = 2,
 };
 
 struct BuildConfig {
   // Coarse to fine. Every radius must be positive and strictly decreasing.
-  std::vector<std::uint32_t> radii{65, 35, 15};
+  std::vector<std::uint32_t> radii{90, 55, 30};
   std::uint32_t max_beacons{4};
   std::uint32_t threads{1};
   std::uint32_t hot_cache_size{16};
+  // Zero fills top worlds up to radii[0]. A smaller positive value keeps each
+  // top world's actual occupied ball tighter, improving exact query bounds.
+  std::uint32_t top_fill_radius{0};
   // Nearest-owner mode may try a future item at R/2 as the center. Nested-ball
   // mode deliberately uses the current uncovered item: pushing leaf centers
   // apart consumes the parent containment slack and degenerates the hierarchy.
@@ -31,7 +35,7 @@ struct BuildConfig {
   // Nested balls builds the leaf worlds online, freezes them, and then packs
   // frozen child balls upward using exact containment. It never performs the
   // nearest-owner correction passes.
-  BuildMode mode{BuildMode::kNestedBalls};
+  BuildMode mode{BuildMode::kTopDownNested};
 };
 
 struct BuildStats {

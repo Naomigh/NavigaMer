@@ -79,13 +79,17 @@ std::vector<std::uint32_t> parse_radii(std::string_view value) {
 }
 
 BuildMode parse_build_mode(std::string_view value) {
+  if (value == "topdown" || value == "top-down") {
+    return BuildMode::kTopDownNested;
+  }
   if (value == "nested" || value == "nested-balls") {
     return BuildMode::kNestedBalls;
   }
   if (value == "owner" || value == "nearest-owner") {
     return BuildMode::kNearestOwner;
   }
-  throw std::invalid_argument("--build-mode must be nested or owner");
+  throw std::invalid_argument(
+      "--build-mode must be topdown, nested, or owner");
 }
 
 void add_stats(QueryStats& total, const QueryStats& value) {
@@ -111,6 +115,40 @@ void add_stats(QueryStats& total, const QueryStats& value) {
   total.boundary_steps += value.boundary_steps;
 }
 
+void add_timings(QueryStageTimings& total, const QueryStageTimings& value) {
+  total.setup_ns += value.setup_ns;
+  total.anchor_ns += value.anchor_ns;
+  if (total.layer_routing_ns.size() < value.layer_routing_ns.size()) {
+    total.layer_routing_ns.resize(value.layer_routing_ns.size());
+  }
+  for (std::size_t layer = 0; layer < value.layer_routing_ns.size(); ++layer) {
+    total.layer_routing_ns[layer] += value.layer_routing_ns[layer];
+  }
+  total.leaf_scan_ns += value.leaf_scan_ns;
+  total.cache_update_ns += value.cache_update_ns;
+  total.accounting_ns += value.accounting_ns;
+  total.total_ns += value.total_ns;
+  total.top_center_edlib_ns += value.top_center_edlib_ns;
+  total.middle_center_edlib_ns += value.middle_center_edlib_ns;
+  total.leaf_center_edlib_ns += value.leaf_center_edlib_ns;
+  total.beacon_edlib_ns += value.beacon_edlib_ns;
+  total.path_pivot_query_edlib_ns += value.path_pivot_query_edlib_ns;
+  total.path_pivot_row_edlib_ns += value.path_pivot_row_edlib_ns;
+  total.query_anchor_edlib_ns += value.query_anchor_edlib_ns;
+  total.leaf_verification_edlib_ns += value.leaf_verification_edlib_ns;
+}
+
+std::uint64_t routing_ns(const QueryStageTimings& timings) {
+  std::uint64_t total = 0;
+  for (const auto value : timings.layer_routing_ns) total += value;
+  return total;
+}
+
+std::uint64_t profiled_phase_ns(const QueryStageTimings& timings) {
+  return timings.setup_ns + timings.anchor_ns + routing_ns(timings) +
+      timings.leaf_scan_ns + timings.cache_update_ns + timings.accounting_ns;
+}
+
 std::uint32_t thread_count(const Arguments& args) {
   const auto requested = static_cast<std::uint32_t>(args.number("--threads", 0));
   return requested == 0 ? std::max(1U, std::thread::hardware_concurrency())
@@ -126,13 +164,15 @@ void build_command(const Arguments& args) {
   auto reference =
       SequenceStore::from_fasta(reference_path, window, stride, limit);
   BuildConfig config;
-  config.radii = parse_radii(args.get("--radii", "65,35,15"));
+  config.radii = parse_radii(args.get("--radii", "90,55,30"));
   config.max_beacons =
       static_cast<std::uint32_t>(args.number("--beacons", 4));
   config.hot_cache_size =
       static_cast<std::uint32_t>(args.number("--hot-cache", 16));
+  config.top_fill_radius =
+      static_cast<std::uint32_t>(args.number("--top-fill-radius", 0));
   config.delayed_centers = !args.flag("--no-delayed-centers");
-  config.mode = parse_build_mode(args.get("--build-mode", "nested"));
+  config.mode = parse_build_mode(args.get("--build-mode", "topdown"));
   config.exact_global_reuse = !args.flag("--local-creation");
   config.threads = thread_count(args);
   BuildStats stats;
@@ -163,18 +203,33 @@ struct StrandResult {
   std::vector<QueryHit> forward;
   std::vector<QueryHit> reverse;
   QueryStats stats;
+  QueryStageTimings timings;
   double query_seconds{0.0};
 };
 
 void query_command(const Arguments& args) {
+  using Clock = std::chrono::steady_clock;
   const auto index_path = args.require("--index");
   const auto reference_path = args.require("--reference");
   const auto query_path = args.require("--queries");
+  const auto index_load_start = Clock::now();
   auto index = NavigaMerIndex::load(index_path);
+  const double index_load_seconds = std::chrono::duration<double>(
+      Clock::now() - index_load_start).count();
+  const auto reference_load_start = Clock::now();
   auto reference = SequenceStore::from_fasta(reference_path, index.window_length,
                                              index.stride, index.reference_count);
+  const double reference_load_seconds = std::chrono::duration<double>(
+      Clock::now() - reference_load_start).count();
+  const auto validate_start = Clock::now();
   index.validate(&reference);
+  const double validate_seconds = std::chrono::duration<double>(
+      Clock::now() - validate_start).count();
+  const auto query_load_start = Clock::now();
   auto queries = read_queries(query_path);
+  const double query_load_seconds = std::chrono::duration<double>(
+      Clock::now() - query_load_start).count();
+  const auto query_prepare_start = Clock::now();
   const auto query_limit = args.number("--limit", 0);
   if (query_limit != 0 && queries.size() > query_limit) {
     queries.resize(query_limit);
@@ -185,13 +240,18 @@ void query_command(const Arguments& args) {
   config.cache_similarity =
       static_cast<std::uint32_t>(args.number("--cache-similarity", 8));
   config.anchor_refresh_interval =
-      static_cast<std::uint32_t>(args.number("--anchor-refresh", 8));
+      static_cast<std::uint32_t>(args.number("--anchor-refresh", 0));
   config.enable_path_cache = !args.flag("--no-cache");
+  config.enable_path_pivot = !args.flag("--no-path-pivot");
+  config.path_pivot_max_distance = static_cast<std::uint32_t>(
+      args.number("--path-pivot-max-distance", 16));
   const bool both_strands = args.flag("--both-strands");
   auto threads = std::min<std::uint32_t>(thread_count(args),
       std::max<std::size_t>(1, queries.size()));
   const auto block_size = std::max<std::uint64_t>(1,
       args.number("--block-size", 64));
+  const double query_prepare_seconds = std::chrono::duration<double>(
+      Clock::now() - query_prepare_start).count();
   std::vector<StrandResult> results(queries.size());
   std::vector<std::future<void>> futures;
   std::atomic<std::uint64_t> next_block{0};
@@ -208,15 +268,20 @@ void query_command(const Arguments& args) {
         for (std::size_t i = begin; i < end; ++i) {
           const auto query_start = std::chrono::steady_clock::now();
           QueryStats forward_stats;
+          QueryStageTimings forward_timings;
           results[i].forward = engine.query(queries[i].sequence, config,
-                                            &forward_stats, &forward_cache);
+                                            &forward_stats, &forward_cache,
+                                            &forward_timings);
           add_stats(results[i].stats, forward_stats);
+          add_timings(results[i].timings, forward_timings);
           if (both_strands) {
             QueryStats reverse_stats;
+            QueryStageTimings reverse_timings;
             const auto rc = reverse_complement(queries[i].sequence);
             results[i].reverse = engine.query(rc, config, &reverse_stats,
-                                              &reverse_cache);
+                                              &reverse_cache, &reverse_timings);
             add_stats(results[i].stats, reverse_stats);
+            add_timings(results[i].timings, reverse_timings);
           }
           results[i].query_seconds = std::chrono::duration<double>(
               std::chrono::steady_clock::now() - query_start).count();
@@ -228,6 +293,7 @@ void query_command(const Arguments& args) {
   const auto elapsed = std::chrono::duration<double>(
       std::chrono::steady_clock::now() - start).count();
 
+  const auto hit_output_start = Clock::now();
   std::ofstream file;
   std::ostream* output = &std::cout;
   if (const auto output_path = args.get("--output"); !output_path.empty()) {
@@ -237,6 +303,7 @@ void query_command(const Arguments& args) {
   }
   *output << "query\tstrand\tsequence_id\tcontig\tposition\tdistance\n";
   QueryStats total;
+  QueryStageTimings total_timings;
   double worker_query_seconds = 0.0;
   for (std::size_t i = 0; i < queries.size(); ++i) {
     auto emit = [&](const std::vector<QueryHit>& hits, char strand) {
@@ -250,8 +317,13 @@ void query_command(const Arguments& args) {
     emit(results[i].forward, '+');
     emit(results[i].reverse, '-');
     add_stats(total, results[i].stats);
+    add_timings(total_timings, results[i].timings);
     worker_query_seconds += results[i].query_seconds;
   }
+  if (file.is_open()) file.flush();
+  const double hit_output_seconds = std::chrono::duration<double>(
+      Clock::now() - hit_output_start).count();
+  const auto timing_output_start = Clock::now();
   if (const auto timings_path = args.get("--timings"); !timings_path.empty()) {
     std::ofstream timings(timings_path);
     if (!timings) {
@@ -266,7 +338,17 @@ void query_command(const Arguments& args) {
                "\tuncategorized_edlib_calls"
                "\tworlds_considered\tworld_center_distances"
                "\tleaf_members_considered\texact_verifications"
-               "\tgreedy_single_steps\tboundary_steps\n";
+               "\tgreedy_single_steps\tboundary_steps"
+               "\tengine_query_us\tsetup_us\tanchor_us\trouting_us";
+    for (std::size_t layer = 0; layer < index.layers.size(); ++layer) {
+      timings << "\tlayer_" << layer << "_routing_us";
+    }
+    timings << "\tleaf_scan_us\tcache_update_us\taccounting_us"
+               "\tprofile_residual_us\ttop_center_edlib_us"
+               "\tmiddle_center_edlib_us\tleaf_center_edlib_us"
+               "\tbeacon_edlib_us\tpath_pivot_query_edlib_us"
+               "\tpath_pivot_row_edlib_us\tquery_anchor_edlib_us"
+               "\tleaf_verification_edlib_us\n";
     timings << std::setprecision(12);
     for (std::size_t i = 0; i < queries.size(); ++i) {
       timings << i << '\t' << queries[i].name << '\t'
@@ -287,20 +369,115 @@ void query_command(const Arguments& args) {
               << results[i].stats.leaf_members_considered << '\t'
               << results[i].stats.exact_verifications << '\t'
               << results[i].stats.greedy_single_steps << '\t'
-              << results[i].stats.boundary_steps << '\n';
+              << results[i].stats.boundary_steps << '\t';
+      const auto& stage = results[i].timings;
+      const auto residual = stage.total_ns >= profiled_phase_ns(stage)
+          ? stage.total_ns - profiled_phase_ns(stage) : 0;
+      timings << stage.total_ns / 1e3 << '\t'
+              << stage.setup_ns / 1e3 << '\t'
+              << stage.anchor_ns / 1e3 << '\t'
+              << routing_ns(stage) / 1e3;
+      for (std::size_t layer = 0; layer < index.layers.size(); ++layer) {
+        const auto value = layer < stage.layer_routing_ns.size()
+            ? stage.layer_routing_ns[layer] : 0;
+        timings << '\t' << value / 1e3;
+      }
+      timings << '\t' << stage.leaf_scan_ns / 1e3
+              << '\t' << stage.cache_update_ns / 1e3
+              << '\t' << stage.accounting_ns / 1e3
+              << '\t' << residual / 1e3
+              << '\t' << stage.top_center_edlib_ns / 1e3
+              << '\t' << stage.middle_center_edlib_ns / 1e3
+              << '\t' << stage.leaf_center_edlib_ns / 1e3
+              << '\t' << stage.beacon_edlib_ns / 1e3
+              << '\t' << stage.path_pivot_query_edlib_ns / 1e3
+              << '\t' << stage.path_pivot_row_edlib_ns / 1e3
+              << '\t' << stage.query_anchor_edlib_ns / 1e3
+              << '\t' << stage.leaf_verification_edlib_ns / 1e3 << '\n';
     }
   }
+  const double timing_output_seconds = std::chrono::duration<double>(
+      Clock::now() - timing_output_start).count();
   const double query_count = static_cast<double>(queries.size());
+  auto mean_us = [&](std::uint64_t nanoseconds) {
+    return queries.empty() ? 0.0
+        : static_cast<double>(nanoseconds) / 1e3 / query_count;
+  };
+  const auto phase_sum = profiled_phase_ns(total_timings);
+  const auto phase_residual = total_timings.total_ns >= phase_sum
+      ? total_timings.total_ns - phase_sum : 0;
+  const auto query_reference_edlib_calls =
+      total.edit_distance_calls - total.path_pivot_row_edlib_calls;
+  auto mean_calls = [&](std::uint64_t calls) {
+    return queries.empty() ? 0.0 : static_cast<double>(calls) / query_count;
+  };
   std::ostringstream report;
   report << std::setprecision(12)
-         << "queries\t" << queries.size() << "\nseconds\t" << elapsed
+         << "queries\t" << queries.size()
+         << "\nthreads\t" << threads
+         << "\nblock_size\t" << block_size
+         << "\nindex_load_seconds\t" << index_load_seconds
+         << "\nreference_load_seconds\t" << reference_load_seconds
+         << "\nindex_validate_seconds\t" << validate_seconds
+         << "\nquery_file_load_seconds\t" << query_load_seconds
+         << "\nquery_prepare_seconds\t" << query_prepare_seconds
+         << "\nworker_wall_seconds\t" << elapsed
+         << "\nhit_output_seconds\t" << hit_output_seconds
+         << "\ntiming_output_seconds\t" << timing_output_seconds
+         << "\nseconds\t" << elapsed
          << "\nqueries_per_second\t"
          << (elapsed == 0 ? 0 : query_count / elapsed)
          << "\naverage_wall_microseconds_per_query\t"
          << (queries.empty() ? 0 : elapsed * 1e6 / query_count)
          << "\nmean_worker_microseconds_per_query\t"
          << (queries.empty() ? 0 : worker_query_seconds * 1e6 / query_count)
+         << "\nmean_engine_microseconds_per_query\t"
+         << mean_us(total_timings.total_ns)
+         << "\nmean_setup_microseconds_per_query\t"
+         << mean_us(total_timings.setup_ns)
+         << "\nmean_anchor_microseconds_per_query\t"
+         << mean_us(total_timings.anchor_ns)
+         << "\nmean_routing_microseconds_per_query\t"
+         << mean_us(routing_ns(total_timings));
+  for (std::size_t layer = 0; layer < index.layers.size(); ++layer) {
+    report << "\nmean_layer_" << layer << "_routing_microseconds_per_query\t"
+           << mean_us(total_timings.layer_routing_ns[layer]);
+  }
+  report << "\nmean_leaf_scan_microseconds_per_query\t"
+         << mean_us(total_timings.leaf_scan_ns)
+         << "\nmean_cache_update_microseconds_per_query\t"
+         << mean_us(total_timings.cache_update_ns)
+         << "\nmean_accounting_microseconds_per_query\t"
+         << mean_us(total_timings.accounting_ns)
+         << "\nmean_profile_residual_microseconds_per_query\t"
+         << mean_us(phase_residual)
+         << "\nmean_top_center_edlib_microseconds_per_query\t"
+         << mean_us(total_timings.top_center_edlib_ns)
+         << "\nmean_middle_center_edlib_microseconds_per_query\t"
+         << mean_us(total_timings.middle_center_edlib_ns)
+         << "\nmean_leaf_center_edlib_microseconds_per_query\t"
+         << mean_us(total_timings.leaf_center_edlib_ns)
+         << "\nmean_beacon_edlib_microseconds_per_query\t"
+         << mean_us(total_timings.beacon_edlib_ns)
+         << "\nmean_path_pivot_query_edlib_microseconds_per_query\t"
+         << mean_us(total_timings.path_pivot_query_edlib_ns)
+         << "\nmean_path_pivot_row_edlib_microseconds_per_query\t"
+         << mean_us(total_timings.path_pivot_row_edlib_ns)
+         << "\nmean_query_anchor_edlib_microseconds_per_query\t"
+         << mean_us(total_timings.query_anchor_edlib_ns)
+         << "\nmean_leaf_verification_edlib_microseconds_per_query\t"
+         << mean_us(total_timings.leaf_verification_edlib_ns)
          << "\nedit_distance_calls\t" << total.edit_distance_calls
+         << "\naverage_edit_distance_calls_per_query\t"
+         << mean_calls(total.edit_distance_calls)
+         << "\nquery_to_reference_edit_distance_calls\t"
+         << query_reference_edlib_calls
+         << "\naverage_query_to_reference_edit_distance_calls_per_query\t"
+         << mean_calls(query_reference_edlib_calls)
+         << "\nreference_to_reference_pivot_row_calls\t"
+         << total.path_pivot_row_edlib_calls
+         << "\naverage_reference_to_reference_pivot_row_calls_per_query\t"
+         << mean_calls(total.path_pivot_row_edlib_calls)
          << "\ntop_center_edlib_calls\t" << total.top_center_edlib_calls
          << "\nmiddle_center_edlib_calls\t"
          << total.middle_center_edlib_calls
@@ -337,6 +514,39 @@ void query_command(const Arguments& args) {
 void inspect_command(const Arguments& args) {
   const auto index = NavigaMerIndex::load(args.require("--index"));
   std::cout << index.summary();
+  if (const auto output_path = args.get("--worlds-output");
+      !output_path.empty()) {
+    std::ofstream output(output_path);
+    if (!output) {
+      throw std::runtime_error("cannot create world table: " + output_path);
+    }
+    output << "node_id\tlayer\tcenter_sequence_id\tcover_radius"
+              "\trepresented_sequences\tchild_count\tbeacon_count"
+              "\tbeacon_sequence_ids\n";
+    for (NodeId id = 0; id < index.nodes.size(); ++id) {
+      const auto& node = index.nodes[id];
+      output << id << '\t';
+      if (node.layer == kSyntheticLayer) {
+        output << "root";
+      } else {
+        output << static_cast<std::uint32_t>(node.layer);
+      }
+      output << '\t';
+      if (node.center_sequence_id == kNoSequence) {
+        output << "NA";
+      } else {
+        output << node.center_sequence_id;
+      }
+      output << '\t' << node.cover_radius << '\t'
+             << node.bwt_interval_length << '\t' << node.child_count << '\t'
+             << static_cast<std::uint32_t>(node.beacon_count) << '\t';
+      for (std::uint32_t beacon = 0; beacon < node.beacon_count; ++beacon) {
+        if (beacon != 0) output << ',';
+        output << index.beacons[node.first_beacon + beacon];
+      }
+      output << '\n';
+    }
+  }
 }
 
 void verify_command(const Arguments& args) {
@@ -355,7 +565,9 @@ void verify_command(const Arguments& args) {
       static_cast<std::uint32_t>(args.number("--tolerance", 5));
   config.enable_path_cache = args.flag("--with-cache");
   config.anchor_refresh_interval =
-      static_cast<std::uint32_t>(args.number("--anchor-refresh", 8));
+      static_cast<std::uint32_t>(args.number("--anchor-refresh", 0));
+  config.path_pivot_max_distance = static_cast<std::uint32_t>(
+      args.number("--path-pivot-max-distance", 16));
   const auto threads = std::min<std::uint32_t>(thread_count(args),
       std::max<std::size_t>(1, queries.size()));
   struct Difference {
@@ -443,21 +655,24 @@ void verify_command(const Arguments& args) {
 void usage(std::ostream& out) {
   out << "NavigaMer: exact multilateration hierarchy (never seed-and-extend)\n\n"
       << "Build:\n  navigamer build --reference ref.fa --output ref.nvm "
-         "[--window 150] [--stride 1] [--radii 65,35,15] "
-         "[--build-mode nested|owner] "
+         "[--window 150] [--stride 1] [--radii 90,55,30] "
+         "[--build-mode topdown|nested|owner] "
          "[--beacons 4] [--threads N] [--no-delayed-centers] [--limit N] "
-         "[--local-creation] "
+         "[--local-creation] [--top-fill-radius 0] "
          "[--stats-output build.tsv]\n\n"
       << "Query:\n  navigamer query --index ref.nvm --reference ref.fa "
          "--queries reads.fq [--tolerance 5] [--threads N] [--both-strands] "
-         "[--no-cache] [--output hits.tsv] [--timings timings.tsv] "
-         "[--stats-output query.tsv] [--anchor-refresh 8] [--block-size 64] "
+         "[--no-cache] [--no-path-pivot] [--path-pivot-max-distance 16] "
+         "[--output hits.tsv] "
+         "[--timings timings.tsv] "
+         "[--stats-output query.tsv] [--anchor-refresh 0] [--block-size 64] "
          "[--limit N]\n\n"
-      << "Inspect:\n  navigamer inspect --index ref.nvm\n";
+      << "Inspect:\n  navigamer inspect --index ref.nvm "
+         "[--worlds-output worlds.tsv]\n";
   out << "\nVerify exactness against brute force:\n  navigamer verify "
          "--index ref.nvm --reference ref.fa --queries queries.fa "
          "[--tolerance 5] [--limit N] [--threads N] [--with-cache] "
-         "[--anchor-refresh 8] [--output verify.tsv]\n";
+         "[--anchor-refresh 0] [--output verify.tsv]\n";
 }
 
 }  // namespace

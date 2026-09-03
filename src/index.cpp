@@ -284,10 +284,39 @@ std::string NavigaMerIndex::summary() const {
       << (routing_mode == RoutingMode::kNestedBalls ? "nested_balls"
                                                      : "nearest_owner")
       << "\nreference_sequences\t" << reference_count << "\nlayers\t"
-      << layers.size() << '\n';
+      << layers.size() << "\nroot_children\t" << nodes[root].child_count
+      << "\nroot_beacons\t"
+      << static_cast<std::uint32_t>(nodes[root].beacon_count) << '\n';
   for (std::size_t i = 0; i < layers.size(); ++i) {
+    std::uint64_t child_sum = 0;
+    std::uint64_t cover_sum = 0;
+    std::uint64_t beacon_sum = 0;
+    std::uint32_t maximum_children = 0;
+    std::uint32_t maximum_cover = 0;
+    std::uint32_t maximum_beacons = 0;
+    for (std::uint64_t local = 0; local < layers[i].node_count; ++local) {
+      const auto& node = nodes[layers[i].first_node + local];
+      child_sum += node.child_count;
+      cover_sum += node.cover_radius;
+      beacon_sum += node.beacon_count;
+      maximum_children = std::max(maximum_children, node.child_count);
+      maximum_cover = std::max(
+          maximum_cover, static_cast<std::uint32_t>(node.cover_radius));
+      maximum_beacons = std::max(
+          maximum_beacons, static_cast<std::uint32_t>(node.beacon_count));
+    }
+    const auto count = static_cast<double>(layers[i].node_count);
     out << "layer_" << i << "_radius\t" << layers[i].radius << '\n'
-        << "layer_" << i << "_worlds\t" << layers[i].node_count << '\n';
+        << "layer_" << i << "_worlds\t" << layers[i].node_count << '\n'
+        << "layer_" << i << "_average_children\t"
+        << (count == 0.0 ? 0.0 : static_cast<double>(child_sum) / count) << '\n'
+        << "layer_" << i << "_maximum_children\t" << maximum_children << '\n'
+        << "layer_" << i << "_average_beacons\t"
+        << (count == 0.0 ? 0.0 : static_cast<double>(beacon_sum) / count) << '\n'
+        << "layer_" << i << "_maximum_beacons\t" << maximum_beacons << '\n'
+        << "layer_" << i << "_average_cover_radius\t"
+        << (count == 0.0 ? 0.0 : static_cast<double>(cover_sum) / count) << '\n'
+        << "layer_" << i << "_maximum_cover_radius\t" << maximum_cover << '\n';
   }
   out << "nodes\t" << nodes.size() << "\nchild_entries\t" << children.size()
       << "\nbeacons\t" << beacons.size()

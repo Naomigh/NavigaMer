@@ -27,7 +27,35 @@ struct QueryConfig {
   std::uint32_t tolerance{5};
   std::uint32_t cache_similarity{8};
   bool enable_path_cache{true};
-  std::uint32_t anchor_refresh_interval{8};
+  bool enable_path_pivot{true};
+  // Keep an already-materialized root pivot row while its exact distance to
+  // the current query is at most this value. The row remains an exact lower-
+  // bound source at any distance; this threshold only trades pruning power
+  // against the O(root children) cost of refreshing it.
+  std::uint32_t path_pivot_max_distance{16};
+  std::uint32_t anchor_refresh_interval{0};
+};
+
+// Inclusive wall-clock phases plus the time spent inside each Edlib call-site
+// role. The Edlib fields are subsets of the inclusive phases and must not be
+// added to them when reconstructing total query time.
+struct QueryStageTimings {
+  std::uint64_t setup_ns{0};
+  std::uint64_t anchor_ns{0};
+  std::vector<std::uint64_t> layer_routing_ns;
+  std::uint64_t leaf_scan_ns{0};
+  std::uint64_t cache_update_ns{0};
+  std::uint64_t accounting_ns{0};
+  std::uint64_t total_ns{0};
+
+  std::uint64_t top_center_edlib_ns{0};
+  std::uint64_t middle_center_edlib_ns{0};
+  std::uint64_t leaf_center_edlib_ns{0};
+  std::uint64_t beacon_edlib_ns{0};
+  std::uint64_t path_pivot_query_edlib_ns{0};
+  std::uint64_t path_pivot_row_edlib_ns{0};
+  std::uint64_t query_anchor_edlib_ns{0};
+  std::uint64_t leaf_verification_edlib_ns{0};
 };
 
 class QueryEngine {
@@ -37,7 +65,8 @@ class QueryEngine {
 
   [[nodiscard]] std::vector<QueryHit> query(
       std::string_view sequence, const QueryConfig& config,
-      QueryStats* stats = nullptr, PathCache* path_cache = nullptr) const;
+      QueryStats* stats = nullptr, PathCache* path_cache = nullptr,
+      QueryStageTimings* timings = nullptr) const;
 
  private:
   const NavigaMerIndex& index_;

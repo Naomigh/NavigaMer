@@ -29,9 +29,10 @@ ctest --test-dir "$project_dir/build" --output-on-failure
   --window 150 \
   --stride 1 \
   --limit "$limit" \
-  --radii 65,35,15 \
-  --build-mode nested \
+  --radii 90,55,30 \
+  --build-mode topdown \
   --local-creation \
+  --top-fill-radius 75 \
   --beacons 4 \
   --threads "$threads"
 
