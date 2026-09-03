@@ -28,6 +28,10 @@ struct QueryConfig {
   std::uint32_t cache_similarity{8};
   bool enable_path_cache{true};
   bool enable_path_pivot{true};
+  // Complete terminal worlds are stored in center-coordinate order. After a
+  // cached leaf boundary crossing, inspect this many adjacent leaf centers
+  // before falling back to the global hierarchy.
+  std::uint32_t leaf_cache_neighborhood{64};
   // Keep an already-materialized root pivot row while its exact distance to
   // the current query is at most this value. The row remains an exact lower-
   // bound source at any distance; this threshold only trades pruning power

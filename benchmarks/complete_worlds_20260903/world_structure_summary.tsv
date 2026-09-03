@@ -1,0 +1,4 @@
+layer	radius	worlds	total_children	mean_children	p50_children	p95_children	p99_children	max_children	beacon_histogram
+large	55	229582	257666	1.122327	1	2	2	3	1:201517,2:28046,3:19
+middle	35	257665	1083553	4.205278	4	5	5	13	3:1,4:257664
+small	15	927924	14754814	15.900886	15	15	45	135	4:927924

@@ -39,7 +39,7 @@ std::vector<SequenceId> ids(const std::vector<QueryHit>& hits) {
 
 void require_nested_containment(const NavigaMerIndex& index,
                                 const SequenceStore& reference) {
-  require(index.routing_mode == RoutingMode::kNestedBalls,
+  require(index.routing_mode == RoutingMode::kCompleteNestedBalls,
           "test index is not nested-ball routed");
   EditDistance distance;
   std::vector<std::uint32_t> memberships(reference.size(), 0);
@@ -72,8 +72,24 @@ void require_nested_containment(const NavigaMerIndex& index,
     }
   }
   require(std::all_of(memberships.begin(), memberships.end(),
-                      [](auto count) { return count == 1; }),
-          "nested leaves do not form a unique physical partition");
+                      [](auto count) { return count >= 1; }),
+          "complete leaves lost a reference sequence");
+  for (std::uint64_t local = 0; local < index.layers.back().node_count;
+       ++local) {
+    const auto leaf_id = index.layers.back().first_node + local;
+    const auto& leaf = index.nodes[leaf_id];
+    std::vector<bool> present(reference.size(), false);
+    for (std::uint32_t ordinal = 0; ordinal < leaf.child_count; ++ordinal) {
+      present[index.children[leaf.first_child + ordinal]] = true;
+    }
+    for (SequenceId sequence = 0; sequence < reference.size(); ++sequence) {
+      const bool expected = distance(reference.sequence(leaf.center_sequence_id),
+                                     reference.sequence(sequence)) <=
+          leaf.cover_radius;
+      require(present[sequence] == expected,
+              "terminal world is not a complete metric ball");
+    }
+  }
 }
 
 void exhaustive_no_false_negative_test() {
@@ -84,7 +100,8 @@ void exhaustive_no_false_negative_test() {
       "GATTACAGACTA", "CCCCAAAATTTT", "CCCCAAAATTTA"};
   auto reference = SequenceStore::from_sequences(std::move(sequences));
   BuildConfig build_config;
-  build_config.radii = {8, 4, 2};
+  build_config.radii = {10, 7, 5};
+  build_config.containment_tolerance = 2;
   build_config.max_beacons = 4;
   build_config.threads = 3;
   NavigaMerIndex index = IndexBuilder(reference).build(build_config);
@@ -177,16 +194,18 @@ void sliding_window_property_test() {
   }
   auto reference = SequenceStore::from_fasta(fasta, 24, 1);
   BuildConfig build_config;
-  build_config.radii = {14, 7, 3};
+  build_config.radii = {16, 10, 7};
+  build_config.containment_tolerance = 3;
   build_config.max_beacons = 4;
   build_config.threads = 4;
   build_config.delayed_centers = true;
   build_config.exact_global_reuse = false;
-  build_config.top_fill_radius = 10;
+  build_config.top_fill_radius = 14;
   auto index = IndexBuilder(reference).build(build_config);
   QueryEngine engine(index, reference);
   QueryConfig query_config{3, 5, true};
   PathCache cache;
+  std::uint64_t cache_contained = 0;
   for (SequenceId source = 0; source < reference.size(); source += 3) {
     auto query = std::string(reference.sequence(source));
     for (int edit = 0; edit < 3; ++edit) {
@@ -194,11 +213,15 @@ void sliding_window_property_test() {
       query[position] = alphabet[random() % 4];
     }
     const auto expected = brute_force(reference, query, query_config.tolerance);
-    require(ids(engine.query(query, query_config, nullptr, &cache)) == expected,
+    QueryStats query_stats;
+    require(ids(engine.query(query, query_config, &query_stats, &cache)) == expected,
             "sliding-window cached hierarchy differs from brute force");
+    cache_contained += query_stats.leaf_cache_contained;
     require(ids(engine.query(query, query_config)) == expected,
             "sliding-window cold hierarchy differs from brute force");
   }
+  require(cache_contained != 0,
+          "sliding-window workload never used strict leaf containment");
   std::filesystem::remove(fasta);
 }
 

@@ -457,6 +457,246 @@ std::vector<TemporaryWorld> repair_parent_layer(
   return parents;
 }
 
+constexpr std::uint32_t kMaximumConstructionQgram = 9;
+constexpr std::uint32_t kConstructionAlphabet = 5;
+
+std::uint32_t construction_symbol(unsigned char symbol) noexcept {
+  switch (symbol) {
+    case 'A': return 0;
+    case 'C': return 1;
+    case 'G': return 2;
+    case 'T': return 3;
+    default: return 4;
+  }
+}
+
+std::uint32_t construction_qgram_code(std::string_view sequence,
+                                      std::size_t offset,
+                                      std::uint32_t qgram) noexcept {
+  std::uint32_t code = 0;
+  for (std::uint32_t i = 0; i < qgram; ++i) {
+    code = code * kConstructionAlphabet +
+        construction_symbol(static_cast<unsigned char>(sequence[offset + i]));
+  }
+  return code;
+}
+
+// Materialize every reference point in every terminal radius ball. Candidate
+// generation uses the exact q-gram count lemma only during construction; all
+// candidates are verified by the full edit metric and the query algorithm
+// never uses seeds. For equal-length strings of length L, ED(A,B)<=R implies
+// at least (L-q+1)-qR shared q-grams (with multiplicity). Occurrences in the
+// underlying contigs contribute whole intervals of sliding windows, so an
+// event sweep avoids expanding the highly redundant postings eagerly.
+void expand_complete_leaf_memberships(
+    const SequenceStore& sequences, const EditDistance& distance,
+    std::vector<TemporaryWorld>& leaves, std::uint32_t radius,
+    std::uint32_t threads) {
+  if (leaves.empty()) throw std::logic_error("cannot expand empty leaf layer");
+  const auto qgram = std::min<std::uint32_t>(
+      kMaximumConstructionQgram,
+      sequences.window_length() / (radius + 1));
+  if (qgram == 0) {
+    throw std::invalid_argument(
+        "terminal radius must be smaller than the indexed window");
+  }
+  const auto qgram_count = sequences.window_length() - qgram + 1;
+  const auto minimum_shared = static_cast<int>(qgram_count) -
+      static_cast<int>(qgram * radius);
+  if (minimum_shared <= 0) {
+    throw std::invalid_argument(
+        "terminal radius is too large for exact construction q-gram filter");
+  }
+  std::uint32_t universe = 1;
+  for (std::uint32_t i = 0; i < qgram; ++i) {
+    universe *= kConstructionAlphabet;
+  }
+  struct Occurrence {
+    std::uint32_t contig{0};
+    std::uint32_t position{0};
+  };
+  std::vector<std::vector<Occurrence>> postings(universe);
+  for (std::uint32_t contig_id = 0; contig_id < sequences.contigs().size();
+       ++contig_id) {
+    const auto& contig = sequences.contigs()[contig_id];
+    if (contig.bases.size() > std::numeric_limits<std::uint32_t>::max()) {
+      throw std::length_error("one contig exceeds construction posting width");
+    }
+    for (std::uint32_t position = 0;
+         position + qgram <= contig.bases.size(); ++position) {
+      postings[construction_qgram_code(contig.bases, position, qgram)].push_back(
+          {contig_id, position});
+    }
+  }
+
+  std::vector<std::vector<SequenceId>> expanded(leaves.size());
+  run_ranges(leaves.size(), threads,
+             [&](std::uint32_t, std::uint64_t begin, std::uint64_t end) {
+    for (std::uint64_t leaf = begin; leaf < end; ++leaf) {
+      struct Event {
+        SequenceId sequence{0};
+        std::int32_t delta{0};
+      };
+      const auto query = sequences.sequence(leaves[leaf].center);
+      std::vector<Event> events;
+      events.reserve(static_cast<std::size_t>(qgram_count) * 64);
+      for (std::uint32_t offset = 0; offset < qgram_count; ++offset) {
+        const auto code = construction_qgram_code(query, offset, qgram);
+        for (const auto occurrence : postings[code]) {
+          const auto& contig = sequences.contigs()[occurrence.contig];
+          if (contig.window_count == 0) continue;
+          const auto reach = sequences.window_length() - qgram;
+          const auto low_base = occurrence.position > reach
+              ? occurrence.position - reach : 0;
+          const auto high_base = std::min<std::uint64_t>(
+              occurrence.position,
+              contig.bases.size() - sequences.window_length());
+          const auto low_ordinal =
+              (low_base + sequences.stride() - 1) / sequences.stride();
+          const auto high_ordinal = high_base / sequences.stride();
+          if (low_ordinal > high_ordinal ||
+              low_ordinal >= contig.window_count) {
+            continue;
+          }
+          const auto bounded_high = std::min<std::uint64_t>(
+              high_ordinal, contig.window_count - 1);
+          events.push_back(
+              {contig.first_sequence_id + low_ordinal, 1});
+          events.push_back(
+              {contig.first_sequence_id + bounded_high + 1, -1});
+        }
+      }
+      std::sort(events.begin(), events.end(), [](const auto& lhs,
+                                                 const auto& rhs) {
+        if (lhs.sequence != rhs.sequence) return lhs.sequence < rhs.sequence;
+        return lhs.delta < rhs.delta;
+      });
+      auto prepared = distance.prepare(query);
+      auto& output = expanded[leaf];
+      std::int32_t shared = 0;
+      SequenceId previous = events.empty() ? 0 : events.front().sequence;
+      std::size_t event = 0;
+      while (event < events.size()) {
+        const auto position = events[event].sequence;
+        if (shared >= minimum_shared) {
+          for (SequenceId candidate = previous; candidate < position;
+               ++candidate) {
+            if (prepared(sequences.sequence(candidate)) <=
+                static_cast<int>(radius)) {
+              output.push_back(candidate);
+            }
+          }
+        }
+        std::int32_t delta = 0;
+        while (event < events.size() && events[event].sequence == position) {
+          delta += events[event].delta;
+          ++event;
+        }
+        shared += delta;
+        previous = position;
+      }
+      std::sort(output.begin(), output.end());
+      output.erase(std::unique(output.begin(), output.end()), output.end());
+      if (output.empty()) {
+        throw std::logic_error("complete terminal world lost its center");
+      }
+    }
+  });
+
+  for (std::size_t leaf = 0; leaf < leaves.size(); ++leaf) {
+    leaves[leaf].members = std::move(expanded[leaf]);
+    leaves[leaf].member_count = leaves[leaf].members.size();
+    leaves[leaf].cover_radius = static_cast<std::uint16_t>(radius);
+  }
+}
+
+// The streaming repair pass establishes one globally valid containing parent.
+// Add the other coordinate-local containing parents used by nearby-query cache
+// hand-offs. Missing a distant redundant edge cannot affect correctness: the
+// repaired skeletal edge remains, and strict early termination is enabled only
+// for complete terminal balls. Sorting parents by SequenceId makes the join a
+// compact, prefetch-friendly neighborhood scan instead of a degenerate global
+// BK range search.
+void rebind_local_containing_parents(
+    const SequenceStore& sequences, const EditDistance& distance,
+    std::vector<TemporaryWorld>& parents,
+    const std::vector<TemporaryWorld>& children, std::uint32_t parent_radius,
+    std::uint32_t hot_cache_size, std::uint32_t threads) {
+  if (parents.empty() || children.empty()) {
+    throw std::logic_error("cannot rebind an empty hierarchy layer");
+  }
+  std::vector<std::uint32_t> parent_order(parents.size());
+  std::iota(parent_order.begin(), parent_order.end(), 0);
+  std::sort(parent_order.begin(), parent_order.end(), [&](auto lhs, auto rhs) {
+    if (parents[lhs].center != parents[rhs].center) {
+      return parents[lhs].center < parents[rhs].center;
+    }
+    return lhs < rhs;
+  });
+
+  std::vector<std::vector<std::uint32_t>> parents_for_child(children.size());
+  run_ranges(children.size(), threads,
+             [&](std::uint32_t, std::uint64_t begin, std::uint64_t end) {
+    for (std::uint64_t child = begin; child < end; ++child) {
+      if (children[child].cover_radius > parent_radius) {
+        throw std::logic_error("child ball exceeds parent layer radius");
+      }
+      const auto slack = parent_radius - children[child].cover_radius;
+      std::vector<std::uint32_t> matches{children[child].parent_local};
+      const auto position = std::lower_bound(
+          parent_order.begin(), parent_order.end(), children[child].center,
+          [&](std::uint32_t parent, SequenceId center) {
+            return parents[parent].center < center;
+          });
+      const auto ordinal = static_cast<std::size_t>(
+          position - parent_order.begin());
+      const auto neighborhood = std::max<std::size_t>(1, hot_cache_size);
+      const auto local_begin = ordinal > neighborhood
+          ? ordinal - neighborhood : 0;
+      const auto local_end = std::min(parent_order.size(),
+                                      ordinal + neighborhood + 1);
+      auto prepared = distance.prepare(
+          sequences.sequence(children[child].center));
+      for (std::size_t local = local_begin; local < local_end; ++local) {
+#if defined(__GNUC__) || defined(__clang__)
+        if (local + 8 < local_end) {
+          __builtin_prefetch(&parents[parent_order[local + 8]], 0, 1);
+        }
+#endif
+        const auto parent = parent_order[local];
+        if (prepared(sequences.sequence(parents[parent].center)) <=
+            static_cast<int>(slack)) {
+          matches.push_back(parent);
+        }
+      }
+      std::sort(matches.begin(), matches.end());
+      matches.erase(std::unique(matches.begin(), matches.end()), matches.end());
+      if (matches.empty()) {
+        throw std::logic_error("rebind lost the repaired containing parent");
+      }
+      parents_for_child[child] = std::move(matches);
+    }
+  });
+
+  for (auto& parent : parents) {
+    parent.child_worlds.clear();
+    parent.member_count = 0;
+    parent.cover_radius = static_cast<std::uint16_t>(parent_radius);
+  }
+  for (std::uint32_t child = 0; child < children.size(); ++child) {
+    for (const auto parent : parents_for_child[child]) {
+      parents[parent].child_worlds.push_back(child);
+      parents[parent].member_count += children[child].member_count;
+    }
+  }
+  for (auto& parent : parents) {
+    std::sort(parent.child_worlds.begin(), parent.child_worlds.end());
+    if (parent.child_worlds.empty()) {
+      throw std::logic_error("rebind produced an empty active parent");
+    }
+  }
+}
+
 struct LocalMetricNode {
   std::uint64_t child_slot{0};
   std::vector<std::pair<std::uint16_t, std::uint32_t>> edges;
@@ -467,7 +707,10 @@ void build_persistent_metric_tree(NavigaMerIndex& index, NodeId parent_id,
                                   const SequenceStore& sequences,
                                   const EditDistance& distance) {
   const auto& parent = index.nodes[parent_id];
-  if (index.is_terminal(parent) || parent.child_count == 0) return;
+  if (index.is_terminal(parent) || parent.child_count == 0 ||
+      (parent_id == index.root && parent.child_count > 8192)) {
+    return;
+  }
 
   std::vector<std::uint64_t> slots(parent.child_count);
   std::iota(slots.begin(), slots.end(), parent.first_child);
@@ -613,10 +856,16 @@ NavigaMerIndex IndexBuilder::build(const BuildConfig& input_config,
   if (config.max_beacons > std::numeric_limits<std::uint8_t>::max()) {
     throw std::invalid_argument("max_beacons above 255 is unsupported");
   }
+  if (config.mode == BuildMode::kTopDownNested &&
+      config.radii.back() <= 2 * config.containment_tolerance) {
+    throw std::invalid_argument(
+        "terminal radius must exceed twice containment tolerance");
+  }
 
   distance_.reset_calls();
   double center_seconds = 0.0;
   double owner_seconds = 0.0;
+  double membership_seconds = 0.0;
   double packing_seconds = 0.0;
   std::vector<std::vector<TemporaryWorld>> temporary(config.radii.size());
   std::vector<SequenceId> all_sequences(sequences_.size());
@@ -632,8 +881,11 @@ NavigaMerIndex IndexBuilder::build(const BuildConfig& input_config,
     selections.reserve(config.radii.size());
     for (std::size_t layer = 0; layer < config.radii.size(); ++layer) {
       selections.push_back(std::async(std::launch::async, [&, layer] {
+        const auto selection_radius = layer == leaf
+            ? config.radii[layer] - 2 * config.containment_tolerance
+            : config.radii[layer];
         return select_centers(
-            sequences_, distance_, all_sequences, config.radii[layer],
+            sequences_, distance_, all_sequences, selection_radius,
             config.hot_cache_size, false, config.exact_global_reuse);
       }));
     }
@@ -651,7 +903,8 @@ NavigaMerIndex IndexBuilder::build(const BuildConfig& input_config,
     const auto owner_start = Clock::now();
     auto partition = assign_online_owners(
         sequences_, distance_, all_sequences, std::move(leaf_selection),
-        config.radii[leaf], config.threads);
+        config.radii[leaf] - 2 * config.containment_tolerance,
+        config.threads);
     owner_seconds = std::chrono::duration<double>(
         Clock::now() - owner_start).count();
     temporary[leaf].reserve(partition.centers.size());
@@ -664,6 +917,13 @@ NavigaMerIndex IndexBuilder::build(const BuildConfig& input_config,
       temporary[leaf].push_back(std::move(world));
     }
 
+    const auto membership_start = Clock::now();
+    expand_complete_leaf_memberships(
+        sequences_, distance_, temporary[leaf], config.radii[leaf],
+        config.threads);
+    membership_seconds = std::chrono::duration<double>(
+        Clock::now() - membership_start).count();
+
     const auto repair_start = Clock::now();
     for (std::size_t child_layer = leaf; child_layer > 0; --child_layer) {
       const auto parent_layer = child_layer - 1;
@@ -675,6 +935,10 @@ NavigaMerIndex IndexBuilder::build(const BuildConfig& input_config,
           sequences_, distance_, std::move(candidate_centers[child_layer - 1]),
           temporary[child_layer], fill_radius,
           config.hot_cache_size, config.exact_global_reuse);
+      rebind_local_containing_parents(
+          sequences_, distance_, temporary[child_layer - 1],
+          temporary[child_layer], fill_radius, config.hot_cache_size,
+          config.threads);
     }
     packing_seconds = std::chrono::duration<double>(
         Clock::now() - repair_start).count();
@@ -795,8 +1059,10 @@ NavigaMerIndex IndexBuilder::build(const BuildConfig& input_config,
   index.window_length = sequences_.window_length();
   index.stride = sequences_.stride();
   index.max_beacons = config.max_beacons;
-  index.routing_mode = config.mode == BuildMode::kNestedBalls ||
-          config.mode == BuildMode::kTopDownNested
+  index.containment_tolerance = config.containment_tolerance;
+  index.routing_mode = config.mode == BuildMode::kTopDownNested
+      ? RoutingMode::kCompleteNestedBalls
+      : config.mode == BuildMode::kNestedBalls
       ? RoutingMode::kNestedBalls
       : RoutingMode::kNearestOwner;
   index.reference_count = sequences_.size();
@@ -832,6 +1098,10 @@ NavigaMerIndex IndexBuilder::build(const BuildConfig& input_config,
   for (std::uint64_t local = 0; local < temporary.front().size(); ++local) {
     append_child(index.nodes[index.root], index.layers.front().first_node + local);
   }
+  index.nodes[index.root].bwt_interval_length = 0;
+  for (const auto& world : temporary.front()) {
+    index.nodes[index.root].bwt_interval_length += world.member_count;
+  }
   for (std::size_t layer = 0; layer < temporary.size(); ++layer) {
     for (std::uint32_t local = 0; local < temporary[layer].size(); ++local) {
       auto& node = index.nodes[index.layers[layer].first_node + local];
@@ -842,8 +1112,7 @@ NavigaMerIndex IndexBuilder::build(const BuildConfig& input_config,
         }
       } else {
         for (const auto child_local : temporary[layer][local].child_worlds) {
-          if (child_local >= temporary[layer + 1].size() ||
-              temporary[layer + 1][child_local].parent_local != local) {
+          if (child_local >= temporary[layer + 1].size()) {
             throw std::logic_error("invalid packed parent-child edge");
           }
           append_child(node,
@@ -949,10 +1218,15 @@ NavigaMerIndex IndexBuilder::build(const BuildConfig& input_config,
     for (const auto& node : index.nodes) {
       if (!index.is_terminal(node)) stats->world_edges += node.child_count;
     }
-    stats->terminal_memberships = sequences_.size();
+    stats->terminal_memberships = 0;
+    for (const auto& leaf : temporary.back()) {
+      stats->terminal_memberships += leaf.members.size();
+    }
+    stats->unique_terminal_memberships = sequences_.size();
     stats->edit_distance_calls = distance_.calls();
     stats->center_seconds = center_seconds;
     stats->owner_seconds = owner_seconds;
+    stats->membership_seconds = membership_seconds;
     stats->packing_seconds = packing_seconds;
     stats->topology_seconds = std::chrono::duration<double>(
         topology_end - topology_start).count();

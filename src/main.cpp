@@ -110,6 +110,10 @@ void add_stats(QueryStats& total, const QueryStats& value) {
   total.leaf_members_considered += value.leaf_members_considered;
   total.leaf_members_mbb_pruned += value.leaf_members_mbb_pruned;
   total.exact_verifications += value.exact_verifications;
+  total.leaf_cache_probes += value.leaf_cache_probes;
+  total.leaf_cache_neighbor_checks += value.leaf_cache_neighbor_checks;
+  total.leaf_cache_contained += value.leaf_cache_contained;
+  total.strict_containment_steps += value.strict_containment_steps;
   total.cache_fast_paths += value.cache_fast_paths;
   total.greedy_single_steps += value.greedy_single_steps;
   total.boundary_steps += value.boundary_steps;
@@ -171,6 +175,8 @@ void build_command(const Arguments& args) {
       static_cast<std::uint32_t>(args.number("--hot-cache", 16));
   config.top_fill_radius =
       static_cast<std::uint32_t>(args.number("--top-fill-radius", 0));
+  config.containment_tolerance = static_cast<std::uint32_t>(
+      args.number("--containment-tolerance", 3));
   config.delayed_centers = !args.flag("--no-delayed-centers");
   config.mode = parse_build_mode(args.get("--build-mode", "topdown"));
   config.exact_global_reuse = !args.flag("--local-creation");
@@ -184,11 +190,14 @@ void build_command(const Arguments& args) {
          << "edit_distance_calls\t" << stats.edit_distance_calls << '\n'
          << "center_seconds\t" << stats.center_seconds << '\n'
          << "owner_seconds\t" << stats.owner_seconds << '\n'
+         << "membership_seconds\t" << stats.membership_seconds << '\n'
          << "packing_seconds\t" << stats.packing_seconds << '\n'
          << "topology_seconds\t" << stats.topology_seconds << '\n'
          << "mbb_seconds\t" << stats.mbb_seconds << '\n'
          << "world_edges\t" << stats.world_edges << '\n'
          << "terminal_memberships\t" << stats.terminal_memberships << '\n';
+  report << "unique_terminal_memberships\t"
+         << stats.unique_terminal_memberships << '\n';
   std::cout << report.str();
   if (const auto stats_path = args.get("--stats-output"); !stats_path.empty()) {
     std::ofstream stats_file(stats_path);
@@ -245,6 +254,8 @@ void query_command(const Arguments& args) {
   config.enable_path_pivot = !args.flag("--no-path-pivot");
   config.path_pivot_max_distance = static_cast<std::uint32_t>(
       args.number("--path-pivot-max-distance", 16));
+  config.leaf_cache_neighborhood = static_cast<std::uint32_t>(
+      args.number("--leaf-cache-neighborhood", 64));
   const bool both_strands = args.flag("--both-strands");
   auto threads = std::min<std::uint32_t>(thread_count(args),
       std::max<std::size_t>(1, queries.size()));
@@ -338,6 +349,9 @@ void query_command(const Arguments& args) {
                "\tuncategorized_edlib_calls"
                "\tworlds_considered\tworld_center_distances"
                "\tleaf_members_considered\texact_verifications"
+               "\tleaf_cache_probes\tleaf_cache_contained"
+               "\tleaf_cache_neighbor_checks"
+               "\tstrict_containment_steps"
                "\tgreedy_single_steps\tboundary_steps"
                "\tengine_query_us\tsetup_us\tanchor_us\trouting_us";
     for (std::size_t layer = 0; layer < index.layers.size(); ++layer) {
@@ -368,6 +382,10 @@ void query_command(const Arguments& args) {
               << results[i].stats.world_center_distances << '\t'
               << results[i].stats.leaf_members_considered << '\t'
               << results[i].stats.exact_verifications << '\t'
+              << results[i].stats.leaf_cache_probes << '\t'
+              << results[i].stats.leaf_cache_contained << '\t'
+              << results[i].stats.leaf_cache_neighbor_checks << '\t'
+              << results[i].stats.strict_containment_steps << '\t'
               << results[i].stats.greedy_single_steps << '\t'
               << results[i].stats.boundary_steps << '\t';
       const auto& stage = results[i].timings;
@@ -498,6 +516,12 @@ void query_command(const Arguments& args) {
          << "\nleaf_members_considered\t" << total.leaf_members_considered
          << "\nleaf_members_mbb_pruned\t" << total.leaf_members_mbb_pruned
          << "\nexact_verifications\t" << total.exact_verifications
+         << "\nleaf_cache_probes\t" << total.leaf_cache_probes
+         << "\nleaf_cache_neighbor_checks\t"
+         << total.leaf_cache_neighbor_checks
+         << "\nleaf_cache_contained\t" << total.leaf_cache_contained
+         << "\nstrict_containment_steps\t"
+         << total.strict_containment_steps
          << "\ncache_fast_paths\t" << total.cache_fast_paths
          << "\ngreedy_single_steps\t" << total.greedy_single_steps
          << "\nboundary_steps\t" << total.boundary_steps << '\n';
@@ -659,10 +683,12 @@ void usage(std::ostream& out) {
          "[--build-mode topdown|nested|owner] "
          "[--beacons 4] [--threads N] [--no-delayed-centers] [--limit N] "
          "[--local-creation] [--top-fill-radius 0] "
+         "[--containment-tolerance 3] "
          "[--stats-output build.tsv]\n\n"
       << "Query:\n  navigamer query --index ref.nvm --reference ref.fa "
          "--queries reads.fq [--tolerance 5] [--threads N] [--both-strands] "
          "[--no-cache] [--no-path-pivot] [--path-pivot-max-distance 16] "
+         "[--leaf-cache-neighborhood 64] "
          "[--output hits.tsv] "
          "[--timings timings.tsv] "
          "[--stats-output query.tsv] [--anchor-refresh 0] [--block-size 64] "

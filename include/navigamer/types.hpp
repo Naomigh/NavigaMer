@@ -21,6 +21,7 @@ inline constexpr std::uint16_t kMissingDistance =
 enum class RoutingMode : std::uint32_t {
   kNearestOwner = 0,
   kNestedBalls = 1,
+  kCompleteNestedBalls = 2,
 };
 
 // Persistent nodes deliberately contain only integer IDs and flat-array ranges.
@@ -32,8 +33,9 @@ struct WorldNode {
   std::uint64_t first_child{0};
   std::uint64_t first_beacon{0};
   std::uint32_t child_count{0};
-  // Maximum exact distance from the center to any uniquely owned member.
-  // It is never larger than the nominal radius of this layer.
+  // Exact geometric radius represented by this node. Complete terminal worlds
+  // contain every indexed reference point inside this radius. Internal nodes
+  // contain every attached child ball in full.
   std::uint16_t cover_radius{0};
   std::uint8_t beacon_count{0};
   std::uint8_t layer{kSyntheticLayer};
@@ -95,6 +97,10 @@ struct QueryStats {
   std::uint64_t leaf_members_considered{0};
   std::uint64_t leaf_members_mbb_pruned{0};
   std::uint64_t exact_verifications{0};
+  std::uint64_t leaf_cache_probes{0};
+  std::uint64_t leaf_cache_neighbor_checks{0};
+  std::uint64_t leaf_cache_contained{0};
+  std::uint64_t strict_containment_steps{0};
   std::uint64_t cache_fast_paths{0};
   std::uint64_t greedy_single_steps{0};
   std::uint64_t boundary_steps{0};

@@ -15,6 +15,7 @@ class NavigaMerIndex {
   std::uint32_t window_length{0};
   std::uint32_t stride{1};
   std::uint32_t max_beacons{0};
+  std::uint32_t containment_tolerance{0};
   RoutingMode routing_mode{RoutingMode::kNearestOwner};
   std::uint64_t reference_count{0};
   std::uint64_t reference_checksum{0};

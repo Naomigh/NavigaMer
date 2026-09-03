@@ -13,11 +13,13 @@ namespace {
 
 struct FileHeader {
   std::array<char, 8> magic{};
-  std::uint32_t version{3};
+  std::uint32_t version{4};
   std::uint32_t endian{0x01020304U};
   std::uint32_t window_length{0};
   std::uint32_t stride{0};
   std::uint32_t max_beacons{0};
+  std::uint32_t routing_mode{0};
+  std::uint32_t containment_tolerance{0};
   std::uint32_t reserved{0};
   std::uint64_t reference_count{0};
   std::uint64_t reference_checksum{0};
@@ -67,11 +69,12 @@ void NavigaMerIndex::save(const std::filesystem::path& path) const {
   std::ofstream output(path, std::ios::binary | std::ios::trunc);
   if (!output) throw std::runtime_error("cannot create index: " + path.string());
   FileHeader header{};
-  std::memcpy(header.magic.data(), "NVMIDX3", 7);
+  std::memcpy(header.magic.data(), "NVMIDX4", 7);
   header.window_length = window_length;
   header.stride = stride;
   header.max_beacons = max_beacons;
-  header.reserved = static_cast<std::uint32_t>(routing_mode);
+  header.routing_mode = static_cast<std::uint32_t>(routing_mode);
+  header.containment_tolerance = containment_tolerance;
   header.reference_count = reference_count;
   header.reference_checksum = reference_checksum;
   header.root = root;
@@ -104,20 +107,22 @@ NavigaMerIndex NavigaMerIndex::load(const std::filesystem::path& path) {
   if (!input) throw std::runtime_error("cannot open index: " + path.string());
   FileHeader header;
   read_raw(input, &header, 1);
-  if (std::string_view(header.magic.data(), 7) != "NVMIDX3") {
+  if (std::string_view(header.magic.data(), 7) != "NVMIDX4") {
     throw std::runtime_error("not a NavigaMer index");
   }
-  if (header.version != 3 || header.endian != 0x01020304U) {
+  if (header.version != 4 || header.endian != 0x01020304U) {
     throw std::runtime_error("unsupported NavigaMer index format");
   }
   NavigaMerIndex index;
   index.window_length = header.window_length;
   index.stride = header.stride;
   index.max_beacons = header.max_beacons;
-  if (header.reserved > static_cast<std::uint32_t>(RoutingMode::kNestedBalls)) {
+  index.containment_tolerance = header.containment_tolerance;
+  if (header.routing_mode >
+      static_cast<std::uint32_t>(RoutingMode::kCompleteNestedBalls)) {
     throw std::runtime_error("unsupported NavigaMer routing mode");
   }
-  index.routing_mode = static_cast<RoutingMode>(header.reserved);
+  index.routing_mode = static_cast<RoutingMode>(header.routing_mode);
   index.reference_count = header.reference_count;
   index.reference_checksum = header.reference_checksum;
   index.root = header.root;
@@ -155,11 +160,16 @@ void NavigaMerIndex::validate(const SequenceStore* reference) const {
     throw std::runtime_error("invalid zero-valued index configuration");
   }
   if (routing_mode != RoutingMode::kNearestOwner &&
-      routing_mode != RoutingMode::kNestedBalls) {
+      routing_mode != RoutingMode::kNestedBalls &&
+      routing_mode != RoutingMode::kCompleteNestedBalls) {
     throw std::runtime_error("invalid routing mode");
   }
   if (layers.empty() || nodes.empty() || root >= nodes.size()) {
     throw std::runtime_error("index has no valid hierarchy root");
+  }
+  if (routing_mode == RoutingMode::kCompleteNestedBalls &&
+      layers.back().radius <= 2 * containment_tolerance) {
+    throw std::runtime_error("complete-world guard band is invalid");
   }
   if (nodes[root].layer != kSyntheticLayer) {
     throw std::runtime_error("root node is not synthetic");
@@ -184,6 +194,11 @@ void NavigaMerIndex::validate(const SequenceStore* reference) const {
       if (nodes[id].cover_radius > info.radius) {
         throw std::runtime_error("world cover radius exceeds nominal radius");
       }
+      if (routing_mode == RoutingMode::kCompleteNestedBalls &&
+          layer + 1 == layers.size() &&
+          nodes[id].cover_radius != info.radius) {
+        throw std::runtime_error("terminal world is not a full-radius ball");
+      }
     }
   }
   for (NodeId node_id = 0; node_id < nodes.size(); ++node_id) {
@@ -193,6 +208,9 @@ void NavigaMerIndex::validate(const SequenceStore* reference) const {
       if (metric_root != kNoNode) {
         throw std::runtime_error("terminal/empty world has a metric root");
       }
+    } else if (node_id == root && node.child_count > 8192 &&
+               metric_root == kNoNode) {
+      // Large roots use a cache-local flat multilateration scan.
     } else if (metric_root >= metric_nodes.size()) {
       throw std::runtime_error("internal world has no valid metric root");
     }
@@ -202,7 +220,8 @@ void NavigaMerIndex::validate(const SequenceStore* reference) const {
         metric_node.first_edge + metric_node.edge_count > metric_edges.size()) {
       throw std::runtime_error("metric node range is invalid");
     }
-    if (routing_mode == RoutingMode::kNestedBalls) {
+    if (routing_mode == RoutingMode::kNestedBalls ||
+        routing_mode == RoutingMode::kCompleteNestedBalls) {
       const auto child = children[metric_node.child_slot];
       if (child >= nodes.size() ||
           metric_node.subtree_cover_radius < nodes[child].cover_radius) {
@@ -281,8 +300,12 @@ std::string NavigaMerIndex::summary() const {
   std::ostringstream out;
   out << "window_length\t" << window_length << "\nstride\t" << stride
       << "\nrouting_mode\t"
-      << (routing_mode == RoutingMode::kNestedBalls ? "nested_balls"
-                                                     : "nearest_owner")
+      << (routing_mode == RoutingMode::kCompleteNestedBalls
+              ? "complete_nested_balls"
+              : routing_mode == RoutingMode::kNestedBalls
+              ? "nested_balls"
+              : "nearest_owner")
+      << "\ncontainment_tolerance\t" << containment_tolerance
       << "\nreference_sequences\t" << reference_count << "\nlayers\t"
       << layers.size() << "\nroot_children\t" << nodes[root].child_count
       << "\nroot_beacons\t"

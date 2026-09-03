@@ -4,6 +4,9 @@
 /paper_reader/
 /Navigamer.pdf
 /REPORT.md
+/benchmarks/
+/ecoli-v2/
+/perf.data
 __pycache__/
 *.pyc
 *.nvm

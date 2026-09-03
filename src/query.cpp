@@ -25,7 +25,9 @@ std::vector<QueryHit> QueryEngine::query(std::string_view sequence,
   const auto calls_at_start = distance_.calls();
   auto prepared_query = distance_.prepare(sequence);
   std::unordered_map<SequenceId, int> exact_distance_cache;
-  exact_distance_cache.reserve(128);
+  exact_distance_cache.reserve(64);
+  const bool complete_worlds =
+      index_.routing_mode == RoutingMode::kCompleteNestedBalls;
 
   auto elapsed_ns = [](Clock::time_point start) {
     return static_cast<std::uint64_t>(
@@ -63,7 +65,7 @@ std::vector<QueryHit> QueryEngine::query(std::string_view sequence,
 
   const auto anchor_start = Clock::now();
   int root_anchor_query_distance = -1;
-  if (config.enable_path_cache && path_cache &&
+  if (!complete_worlds && config.enable_path_cache && path_cache &&
       config.anchor_refresh_interval != 0) {
     const auto& root = index_.nodes[index_.root];
     const bool refresh = path_cache->root_anchor_query.empty() ||
@@ -108,6 +110,8 @@ std::vector<QueryHit> QueryEngine::query(std::string_view sequence,
     int distance{0};
   };
 
+  bool strict_containment_found = false;
+
   auto children_in_nested_balls = [&](NodeId parent_id,
                                       NodeId cached_child) {
     const auto& parent = index_.nodes[parent_id];
@@ -138,6 +142,14 @@ std::vector<QueryHit> QueryEngine::query(std::string_view sequence,
                 : local_timings.leaf_center_edlib_ns);
         ++local_stats.world_center_distances;
         used_cached_hint = true;
+        if (complete_worlds && index_.is_terminal(index_.nodes[cached_child]) &&
+            cached_query_distance + static_cast<int>(config.tolerance) <=
+                static_cast<int>(index_.nodes[cached_child].cover_radius)) {
+          strict_containment_found = true;
+          ++local_stats.strict_containment_steps;
+          ++local_stats.cache_fast_paths;
+          return std::vector<Candidate>{{cached_child, cached_query_distance}};
+        }
       }
     }
 
@@ -155,7 +167,7 @@ std::vector<QueryHit> QueryEngine::query(std::string_view sequence,
     // dynamic multilateration bound and never a candidate cap.
     NodeId root_path_pivot = kNoNode;
     int root_path_pivot_query_distance = 0;
-    if (parent_id == index_.root &&
+    if (!complete_worlds && parent_id == index_.root &&
         index_.dense_pair_offsets[parent_id] == kNoNode &&
         config.enable_path_pivot && cache_applicable && path_cache) {
       // Reusing a still-proximal row avoids rebuilding one distance to every
@@ -208,6 +220,15 @@ std::vector<QueryHit> QueryEngine::query(std::string_view sequence,
           index_.nodes[root_path_pivot].center_sequence_id;
       auto prepared_pivot = distance_.prepare(reference_.sequence(pivot_center));
       for (std::uint32_t ordinal = 0; ordinal < parent.child_count; ++ordinal) {
+#if defined(__GNUC__) || defined(__clang__)
+        if (ordinal + 16 < parent.child_count) {
+          const auto future_slot = parent.first_child + ordinal + 16;
+          __builtin_prefetch(&index_.children[future_slot], 0, 1);
+          __builtin_prefetch(
+              &index_.child_beacon_distances[
+                  future_slot * index_.max_beacons], 0, 1);
+        }
+#endif
         const auto child = index_.children[parent.first_child + ordinal];
         const auto center = index_.nodes[child].center_sequence_id;
         const auto start = Clock::now();
@@ -303,16 +324,25 @@ std::vector<QueryHit> QueryEngine::query(std::string_view sequence,
           ++local_stats.worlds_mbb_pruned;
           continue;
         }
-        const int d = exact_to_reference(child.center_sequence_id,
-                                         center_edlib_calls,
-                                         parent_id == index_.root
-                                             ? local_timings.top_center_edlib_ns
-                                             : parent.layer == 0
-                                             ? local_timings.middle_center_edlib_ns
-                                             : local_timings.leaf_center_edlib_ns);
+        const int d = exact_to_reference(
+            child.center_sequence_id, center_edlib_calls,
+            parent_id == index_.root
+                ? local_timings.top_center_edlib_ns
+                : parent.layer == 0
+                ? local_timings.middle_center_edlib_ns
+                : local_timings.leaf_center_edlib_ns);
         ++local_stats.world_center_distances;
         ++local_stats.worlds_considered;
-        if (d <= intersection_bound) result.push_back({child_id, d});
+        if (d <= intersection_bound) {
+          if (complete_worlds && index_.is_terminal(child) &&
+              d + static_cast<int>(config.tolerance) <=
+                  static_cast<int>(child.cover_radius)) {
+            strict_containment_found = true;
+            ++local_stats.strict_containment_steps;
+            return std::vector<Candidate>{{child_id, d}};
+          }
+          result.push_back({child_id, d});
+        }
       }
     } else {
       std::vector<std::uint32_t> stack{
@@ -357,6 +387,13 @@ std::vector<QueryHit> QueryEngine::query(std::string_view sequence,
         ++local_stats.world_center_distances;
         if (d <= static_cast<int>(child.cover_radius) +
                      static_cast<int>(config.tolerance)) {
+          if (complete_worlds && index_.is_terminal(child) &&
+              d + static_cast<int>(config.tolerance) <=
+                  static_cast<int>(child.cover_radius)) {
+            strict_containment_found = true;
+            ++local_stats.strict_containment_steps;
+            return std::vector<Candidate>{{child_id, d}};
+          }
           result.push_back({child_id, d});
         }
         for (std::uint32_t edge_ordinal = 0;
@@ -631,17 +668,90 @@ std::vector<QueryHit> QueryEngine::query(std::string_view sequence,
 
   std::vector<NodeId> current{index_.root};
   std::vector<NodeId> new_path(index_.layers.size(), kNoNode);
-  for (std::size_t depth = 0; depth < index_.layers.size(); ++depth) {
+  std::size_t start_depth = 0;
+  if (complete_worlds && cache_applicable &&
+      path_cache->contained_path.size() == index_.layers.size()) {
+    const auto cached_leaf = path_cache->contained_path.back();
+    if (cached_leaf != kNoNode && cached_leaf < index_.nodes.size() &&
+        index_.is_terminal(index_.nodes[cached_leaf])) {
+      ++local_stats.leaf_cache_probes;
+      const int d = exact_to_reference(
+          index_.nodes[cached_leaf].center_sequence_id,
+          local_stats.leaf_center_edlib_calls,
+          local_timings.leaf_center_edlib_ns);
+      ++local_stats.world_center_distances;
+      if (d + static_cast<int>(config.tolerance) <=
+          static_cast<int>(index_.nodes[cached_leaf].cover_radius)) {
+        ++local_stats.leaf_cache_contained;
+        ++local_stats.cache_fast_paths;
+        ++local_stats.strict_containment_steps;
+        current.assign(1, cached_leaf);
+        new_path = path_cache->contained_path;
+        start_depth = index_.layers.size();
+      } else if (config.leaf_cache_neighborhood != 0) {
+        const auto& leaf_layer = index_.layers.back();
+        const auto cached_ordinal = cached_leaf - leaf_layer.first_node;
+        NodeId contained_leaf = kNoNode;
+        for (std::uint64_t delta = 1;
+             delta <= config.leaf_cache_neighborhood; ++delta) {
+          const NodeId probes[2] = {
+              cached_ordinal + delta < leaf_layer.node_count
+                  ? leaf_layer.first_node + cached_ordinal + delta : kNoNode,
+              cached_ordinal >= delta
+                  ? leaf_layer.first_node + cached_ordinal - delta : kNoNode};
+          for (const auto probe : probes) {
+            if (probe == kNoNode) continue;
+#if defined(__GNUC__) || defined(__clang__)
+            const auto prefetch_ordinal = cached_ordinal + delta + 4;
+            if (prefetch_ordinal < leaf_layer.node_count) {
+              __builtin_prefetch(
+                  &index_.nodes[leaf_layer.first_node + prefetch_ordinal],
+                  0, 1);
+            }
+#endif
+            ++local_stats.leaf_cache_neighbor_checks;
+            const int probe_distance = exact_to_reference(
+                index_.nodes[probe].center_sequence_id,
+                local_stats.leaf_center_edlib_calls,
+                local_timings.leaf_center_edlib_ns);
+            ++local_stats.world_center_distances;
+            if (probe_distance + static_cast<int>(config.tolerance) <=
+                static_cast<int>(index_.nodes[probe].cover_radius)) {
+              contained_leaf = probe;
+              break;
+            }
+          }
+          if (contained_leaf != kNoNode) break;
+        }
+        if (contained_leaf != kNoNode) {
+          ++local_stats.leaf_cache_contained;
+          ++local_stats.cache_fast_paths;
+          ++local_stats.strict_containment_steps;
+          current.assign(1, contained_leaf);
+          new_path = path_cache->contained_path;
+          new_path.back() = contained_leaf;
+          start_depth = index_.layers.size();
+        }
+      }
+    }
+  }
+  for (std::size_t depth = start_depth; depth < index_.layers.size(); ++depth) {
     const auto layer_start = Clock::now();
     const NodeId cached_child = cache_applicable &&
             depth < path_cache->contained_path.size()
         ? path_cache->contained_path[depth]
         : kNoNode;
     std::vector<Candidate> candidates;
+    strict_containment_found = false;
     for (const auto parent : current) {
-      auto local = index_.routing_mode == RoutingMode::kNestedBalls
+      auto local = index_.routing_mode == RoutingMode::kNestedBalls ||
+              index_.routing_mode == RoutingMode::kCompleteNestedBalls
           ? children_in_nested_balls(parent, cached_child)
           : children_near_nearest(parent, cached_child);
+      if (strict_containment_found) {
+        candidates = std::move(local);
+        break;
+      }
       candidates.insert(candidates.end(), local.begin(), local.end());
     }
     std::sort(candidates.begin(), candidates.end(), [](const auto& lhs,
@@ -683,6 +793,15 @@ std::vector<QueryHit> QueryEngine::query(std::string_view sequence,
                              local_timings.beacon_edlib_ns);
     }
     for (std::uint32_t ordinal = 0; ordinal < leaf.child_count; ++ordinal) {
+#if defined(__GNUC__) || defined(__clang__)
+      if (ordinal + 16 < leaf.child_count) {
+        const auto future_slot = leaf.first_child + ordinal + 16;
+        __builtin_prefetch(&index_.children[future_slot], 0, 1);
+        __builtin_prefetch(
+            &index_.child_beacon_distances[
+                future_slot * index_.max_beacons], 0, 1);
+      }
+#endif
       ++local_stats.leaf_members_considered;
       const auto child_slot = leaf.first_child + ordinal;
       const auto sequence_id = index_.children[child_slot];

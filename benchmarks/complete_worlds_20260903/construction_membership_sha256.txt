@@ -1,0 +1,2 @@
+4bdbb5e23f86abd2977ccdd12aff769d7a7bf2a050f494b6d0a00533d283ddab  ecoli_100k_r55_35_15.nvm
+4bdbb5e23f86abd2977ccdd12aff769d7a7bf2a050f494b6d0a00533d283ddab  ecoli_100k_r55_35_15_qgram.nvm

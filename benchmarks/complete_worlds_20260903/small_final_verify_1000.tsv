@@ -1,0 +1,9 @@
+verified_queries	1000
+reference_sequences	9851
+false_negatives	0
+false_positives	0
+expected_hits	1001
+observed_hits	1001
+false_negative_rate	0
+false_positive_rate	0
+seconds	0.281088194
