@@ -1,4 +1,0 @@
-configuration	block_size	worker_wall_seconds	queries_per_second	average_edit_distance_calls	index_bytes	build_wall_seconds
-old_unique_owner	256	51.68355	1934.851583	24387.95503	204135568	82.084
-complete_world_same_block	256	2.161961831	46254.285606	902.31705	424398579	163.44
-complete_world_tuned_median	4352	0.435366011	229691.793740	57.43832	424398579	163.44
