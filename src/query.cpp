@@ -35,7 +35,6 @@ std::vector<QueryHit> QueryEngine::query_one(
     std::string_view sequence, bool reverse, const QueryConfig& config,
     PathCache* cache, QueryStats* stats) const {
   QueryStats local;
-  auto prepared = EditDistance{}.prepare(sequence);
   auto route = [&](NodeId parent_id, std::size_t depth, NodeId cached_child) {
     const auto& parent = index_.nodes[parent_id];
     std::vector<int> distances(parent.child_count, -1);
@@ -43,7 +42,7 @@ std::vector<QueryHit> QueryEngine::query_one(
       auto& distance = distances[ordinal];
       if (distance < 0) {
         const auto child = index_.children[parent.first_child + ordinal];
-        distance = prepared.exact(index_.center_sequences[child]);
+        distance = EditDistance::exact(sequence, index_.center_sequences[child]);
         ++local.route_edit_calls[depth];
         ++local.route_candidates[depth];
       }

@@ -17,7 +17,7 @@
 
 namespace {
 
-int distance(std::string_view lhs, std::string_view rhs) {
+int dynamic_programming_distance(std::string_view lhs, std::string_view rhs) {
   std::vector<int> previous(rhs.size() + 1), current(rhs.size() + 1);
   for (std::size_t j = 0; j <= rhs.size(); ++j) previous[j] = j;
   for (std::size_t i = 1; i <= lhs.size(); ++i) {
@@ -29,6 +29,10 @@ int distance(std::string_view lhs, std::string_view rhs) {
     previous.swap(current);
   }
   return previous.back();
+}
+
+int distance(std::string_view lhs, std::string_view rhs) {
+  return navigamer::EditDistance::exact(lhs, rhs);
 }
 
 std::vector<std::string> strings(std::string_view alphabet, std::size_t length) {
@@ -106,19 +110,15 @@ void check_hierarchy(const navigamer::NavigaMerIndex& index,
       check_hierarchy(index, reference, config, child_id, expected, depth + 1);
     }
   }
-  if (depth == 0) {
-    assert(parent.beacon_count == 0);
-  } else {
-    assert(parent.beacon_count == static_cast<std::uint64_t>(
-        std::ceil(config.beacon_ratios[depth - 1] * parent.child_count)));
-    for (std::uint64_t row = 0; row < parent.child_count; ++row) {
-      const auto child = index.children[parent.first_child + row];
-      for (std::uint64_t b = 0; b < parent.beacon_count; ++b) {
-        const auto ordinal = index.beacon_ordinals[parent.first_beacon + b];
-        const auto beacon = index.children[parent.first_child + ordinal];
-        assert(index.beacon_distances[parent.first_distance + row * parent.beacon_count + b] ==
-               distance(index.center_sequences[child], index.center_sequences[beacon]));
-      }
+  assert(parent.beacon_count == static_cast<std::uint64_t>(
+      std::ceil(config.beacon_ratios[depth] * parent.child_count)));
+  for (std::uint64_t row = 0; row < parent.child_count; ++row) {
+    const auto child = index.children[parent.first_child + row];
+    for (std::uint64_t b = 0; b < parent.beacon_count; ++b) {
+      const auto ordinal = index.beacon_ordinals[parent.first_beacon + b];
+      const auto beacon = index.children[parent.first_child + ordinal];
+      assert(index.beacon_distances[parent.first_distance + row * parent.beacon_count + b] ==
+             distance(index.center_sequences[child], index.center_sequences[beacon]));
     }
   }
 }
@@ -161,12 +161,17 @@ void test_distance() {
   auto targets = strings("ACN", 4);
   targets.push_back("");
   for (const auto& lhs : inputs) {
-    auto prepared = navigamer::EditDistance{}.prepare(lhs);
     for (const auto& rhs : targets) {
-      const int expected = distance(lhs, rhs);
-      assert(prepared.exact(rhs) == expected);
+      const int expected = dynamic_programming_distance(lhs, rhs);
+      assert(navigamer::EditDistance::exact(lhs, rhs) == expected);
       for (int t = 0; t <= 4; ++t) {
-        assert(navigamer::EditDistance::bounded(lhs, rhs, t) == (expected <= t ? expected : -1));
+        const int actual = navigamer::EditDistance::bounded(lhs, rhs, t);
+        if (actual != (expected <= t ? expected : -1)) {
+          std::cerr << "bounded mismatch lhs=" << lhs << " rhs=" << rhs
+                    << " k=" << t << " expected=" << expected
+                    << " actual=" << actual << '\n';
+          assert(false);
+        }
       }
     }
   }
@@ -175,16 +180,43 @@ void test_distance() {
     std::string lhs(length, 'A'), rhs(length + 1, 'A');
     for (auto& c : lhs) c = "ACGTN"[rng() % 5];
     for (auto& c : rhs) c = "ACGTN"[rng() % 5];
-    auto prepared = navigamer::EditDistance{}.prepare(lhs);
-    assert(prepared.exact(rhs) == distance(lhs, rhs));
-    prepared.reset(rhs);
-    assert(prepared.exact(lhs) == distance(lhs, rhs));
+    assert(navigamer::EditDistance::exact(lhs, rhs) ==
+           dynamic_programming_distance(lhs, rhs));
+    assert(navigamer::EditDistance::exact(rhs, lhs) ==
+           dynamic_programming_distance(lhs, rhs));
     assert(navigamer::EditDistance::exact("", rhs) == static_cast<int>(rhs.size()));
     auto edited = lhs;
     edited.insert(edited.begin() + edited.size() / 2, 'N');
     assert(navigamer::EditDistance::bounded(lhs, edited, 1) == 1);
     assert(navigamer::EditDistance::bounded(lhs, edited, 0) == -1);
   }
+}
+
+void test_multilateration_boundary() {
+  const auto reference = navigamer::SequenceStore::from_sequences(
+      {"AAAAAAAAAA", "CCCCAAAAAA", "CCCCCCCCCC",
+       "CAAAAAAAAA", "CAAAAAAAAA"});
+  navigamer::BuildConfig config;
+  config.center_radii = {3, 3, 3};
+  config.beacon_ratios = {0.1, 0.1, 0.1};
+  config.max_tolerance = 1;
+  config.threads = 3;
+  navigamer::BuildStats stats;
+  const auto index = navigamer::IndexBuilder::build(reference, config, &stats);
+  assert(index.layers[0].node_count == 3);
+  const auto first = descendants(index, index.children[index.nodes[0].first_child]);
+  const auto second = descendants(index, index.children[index.nodes[0].first_child + 1]);
+  const auto third = descendants(index, index.children[index.nodes[0].first_child + 2]);
+  assert(first.contains(3) && first.contains(4));
+  assert(second.contains(3) && second.contains(4));
+  assert(!third.contains(3) && !third.contains(4));
+  assert(first.contains(0) && !second.contains(0));
+  assert(second.contains(1) && !first.contains(1));
+  assert(third.contains(2) && !first.contains(2) && !second.contains(2));
+  assert(stats.layers[0].member_beacon_edit_calls == 2);
+  assert(stats.layers[0].candidate_edit_calls == 2);
+  assert(stats.layers[0].pruned_center_pairs == 2);
+  check_hierarchy(index, reference, config, 0, {0, 1, 2, 3, 4}, 0);
 }
 
 void test_exclusive_centers() {
@@ -207,8 +239,9 @@ void test_index(const std::filesystem::path& directory) {
   navigamer::BuildConfig config;
   config.center_radii = {3, 3, 3};
   config.max_tolerance = 1;
-  config.beacon_ratios = {0.4, 0.6};
-  const auto index = navigamer::IndexBuilder::build(reference, config);
+  config.beacon_ratios = {0.4, 0.6, 0.5};
+  navigamer::BuildStats single_stats;
+  const auto index = navigamer::IndexBuilder::build(reference, config, &single_stats);
   std::vector<navigamer::SequenceId> members(reference.size());
   for (std::size_t i = 0; i < members.size(); ++i) members[i] = i;
   check_hierarchy(index, reference, config, 0, members, 0);
@@ -249,13 +282,28 @@ void test_index(const std::filesystem::path& directory) {
   navigamer::QueryEngine owned_engine(restored, different_reference);
   check_hits(oracle(reference, "AAAA", 1, false), owned_engine.query("AAAA", {1}));
   for (const double ratio : {0.0, 1.0}) {
-    config.beacon_ratios = {ratio, ratio};
-    const auto alternate = navigamer::IndexBuilder::build(reference, config);
+    config.beacon_ratios = {ratio, ratio, ratio};
+    navigamer::BuildStats alternate_stats;
+    const auto alternate = navigamer::IndexBuilder::build(
+        reference, config, &alternate_stats);
     check_hierarchy(alternate, reference, config, 0, members, 0);
-    navigamer::QueryEngine alternate_engine(alternate, reference);
+    const auto path = directory / (ratio == 0.0 ? "zero.nvm" : "full.nvm");
+    alternate.save(path);
+    const auto reloaded = navigamer::NavigaMerIndex::load(path);
+    navigamer::QueryEngine alternate_engine(reloaded, reference);
     for (const auto& query : queries4) {
       check_hits(oracle(reference, query, 1, false), alternate_engine.query(query, {1}));
       ++evaluations;
+    }
+    for (const auto& layer : alternate_stats.layers) {
+      if (ratio == 0.0) {
+        assert(layer.member_beacon_edit_calls == 0);
+        assert(layer.pruned_center_pairs == 0);
+        assert(layer.candidate_edit_calls == layer.classification_center_pairs);
+      } else {
+        assert(layer.member_beacon_edit_calls == layer.classification_center_pairs);
+        assert(layer.candidate_edit_calls == 0);
+      }
     }
   }
   std::cout << "query_evaluations=" << evaluations << " false_negatives=0 false_positives=0\n";
@@ -296,7 +344,7 @@ void test_genome_schedule() {
   const auto reference = navigamer::SequenceStore::from_sequences(values);
   navigamer::BuildConfig config;
   config.max_tolerance = 2;
-  config.beacon_ratios = {0.25, 0.5};
+  config.beacon_ratios = {0.25, 0.5, 0.75};
   config.threads = 3;
   const auto index = navigamer::IndexBuilder::build(reference, config);
   std::vector<navigamer::SequenceId> members(reference.size());
@@ -334,6 +382,7 @@ int main(int argc, char** argv) {
   std::filesystem::create_directories(directory);
   test_distance();
   test_exclusive_centers();
+  test_multilateration_boundary();
   test_index(directory);
   test_files(directory);
   test_genome_schedule();

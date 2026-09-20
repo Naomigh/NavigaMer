@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.20)
-project(NavigaMer VERSION 1.0.0 LANGUAGES CXX)
+project(NavigaMer VERSION 1.1.0 LANGUAGES CXX)
 
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -7,6 +7,9 @@ set(CMAKE_CXX_EXTENSIONS OFF)
 
 find_package(Threads REQUIRED)
 option(NAVIGAMER_NATIVE "Tune optimized builds for the current CPU" OFF)
+
+add_library(edlib STATIC third_party/edlib/src/edlib.cpp)
+target_include_directories(edlib PUBLIC third_party/edlib/include)
 
 add_library(navigamer_core
   src/sequence_store.cpp
@@ -16,11 +19,14 @@ add_library(navigamer_core
   src/query.cpp
 )
 target_include_directories(navigamer_core PUBLIC include)
-target_link_libraries(navigamer_core PUBLIC Threads::Threads)
+target_link_libraries(navigamer_core PUBLIC edlib Threads::Threads)
 target_compile_options(navigamer_core PRIVATE
   $<$<CXX_COMPILER_ID:GNU,Clang>:-Wall;-Wextra;-Wpedantic>
 )
 if(NAVIGAMER_NATIVE)
+  target_compile_options(edlib PRIVATE
+    $<$<CXX_COMPILER_ID:GNU,Clang>:-march=native>
+  )
   target_compile_options(navigamer_core PRIVATE
     $<$<CXX_COMPILER_ID:GNU,Clang>:-march=native>
   )

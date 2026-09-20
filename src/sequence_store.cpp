@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <cctype>
 #include <fstream>
+#include <stdexcept>
 
 namespace navigamer {
 namespace {
@@ -34,6 +35,10 @@ SequenceStore SequenceStore::from_fasta(const std::filesystem::path& path,
                                         std::uint32_t stride,
                                         std::uint64_t limit) {
   std::ifstream input(path);
+  if (!input) throw std::runtime_error("cannot open reference: " + path.string());
+  if (window_length == 0 || stride == 0) {
+    throw std::invalid_argument("window length and stride must be positive");
+  }
   SequenceStore store;
   store.window_length_ = window_length;
   store.stride_ = stride;
@@ -69,8 +74,16 @@ SequenceStore SequenceStore::from_fasta(const std::filesystem::path& path,
 }
 
 SequenceStore SequenceStore::from_sequences(std::vector<std::string> sequences) {
+  if (sequences.empty()) {
+    throw std::invalid_argument("sequence collection must not be empty");
+  }
   SequenceStore store;
   store.window_length_ = sequences[0].size();
+  for (const auto& sequence : sequences) {
+    if (sequence.size() != store.window_length_) {
+      throw std::invalid_argument("all reference sequences must have equal length");
+    }
+  }
   store.stride_ = store.window_length_;
   store.sequence_count_ = sequences.size();
   for (SequenceId id = 0; id < sequences.size(); ++id) {
@@ -101,9 +114,11 @@ std::pair<std::string_view, std::uint64_t> SequenceStore::location(SequenceId id
 std::vector<QueryRecord> read_queries(const std::filesystem::path& path,
                                       std::uint64_t limit) {
   std::ifstream input(path);
+  if (!input) throw std::runtime_error("cannot open query file: " + path.string());
   std::vector<QueryRecord> records;
   std::string first;
   while (std::getline(input, first) && first.empty()) {}
+  if (first.empty()) throw std::runtime_error("query file is empty: " + path.string());
   if (first.front() == '>') {
     QueryRecord current{first.substr(1), {}};
     std::string line;
@@ -120,15 +135,23 @@ std::vector<QueryRecord> read_queries(const std::filesystem::path& path,
     current.sequence = clean_sequence(current.sequence);
     records.push_back(std::move(current));
   } else {
+    if (first.front() != '@') {
+      throw std::runtime_error("query file is neither FASTA nor FASTQ: " + path.string());
+    }
     std::string header = std::move(first);
     do {
       std::string sequence, plus, quality;
-      std::getline(input, sequence);
-      std::getline(input, plus);
-      std::getline(input, quality);
+      if (!std::getline(input, sequence) || !std::getline(input, plus) ||
+          !std::getline(input, quality) || plus.empty() || plus.front() != '+') {
+        throw std::runtime_error("truncated FASTQ record in: " + path.string());
+      }
       records.push_back({header.substr(1), clean_sequence(sequence)});
       if (limit != 0 && records.size() == limit) return records;
-    } while (std::getline(input, header));
+      if (!std::getline(input, header)) break;
+      if (header.empty() || header.front() != '@') {
+        throw std::runtime_error("invalid FASTQ header in: " + path.string());
+      }
+    } while (true);
   }
   return records;
 }

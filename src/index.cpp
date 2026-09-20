@@ -1,10 +1,14 @@
 #include "navigamer/index.hpp"
 
+#include <array>
 #include <fstream>
 #include <sstream>
+#include <stdexcept>
 
 namespace navigamer {
 namespace {
+
+constexpr std::array<char, 8> kIndexMagic{'N', 'V', 'M', 'I', 'D', 'X', '2', '\0'};
 
 template <typename T>
 void write_value(std::ostream& out, const T& value) {
@@ -15,6 +19,7 @@ template <typename T>
 T read_value(std::istream& in) {
   T value{};
   in.read(reinterpret_cast<char*>(&value), sizeof(T));
+  if (!in) throw std::runtime_error("truncated NavigaMer index");
   return value;
 }
 
@@ -28,6 +33,7 @@ template <typename T>
 std::vector<T> read_vector(std::istream& in) {
   std::vector<T> values(read_value<std::uint64_t>(in));
   in.read(reinterpret_cast<char*>(values.data()), values.size() * sizeof(T));
+  if (!in) throw std::runtime_error("truncated NavigaMer index");
   return values;
 }
 
@@ -44,6 +50,7 @@ std::vector<std::string> read_strings(std::istream& in) {
   for (auto& string : strings) {
     string.resize(read_value<std::uint64_t>(in));
     in.read(string.data(), string.size());
+    if (!in) throw std::runtime_error("truncated NavigaMer index");
   }
   return strings;
 }
@@ -52,6 +59,9 @@ std::vector<std::string> read_strings(std::istream& in) {
 
 void NavigaMerIndex::save(const std::filesystem::path& path) const {
   std::ofstream out(path, std::ios::binary);
+  if (!out) throw std::runtime_error("cannot open index for writing: " + path.string());
+  out.write(kIndexMagic.data(), kIndexMagic.size());
+  write_value(out, kIndexFormatVersion);
   write_value(out, window_length);
   write_value(out, stride);
   write_value(out, max_tolerance);
@@ -80,10 +90,23 @@ void NavigaMerIndex::save(const std::filesystem::path& path) const {
   write_strings(out, leaf_sequences);
   write_vector(out, beacon_ordinals);
   write_vector(out, beacon_distances);
+  out.flush();
+  if (!out) throw std::runtime_error("failed while writing index: " + path.string());
 }
 
 NavigaMerIndex NavigaMerIndex::load(const std::filesystem::path& path) {
   std::ifstream in(path, std::ios::binary);
+  if (!in) throw std::runtime_error("cannot open index for reading: " + path.string());
+  std::array<char, kIndexMagic.size()> magic{};
+  in.read(magic.data(), magic.size());
+  if (!in || magic != kIndexMagic) {
+    throw std::runtime_error("unsupported NavigaMer index format: " + path.string());
+  }
+  const auto version = read_value<std::uint32_t>(in);
+  if (version != kIndexFormatVersion) {
+    throw std::runtime_error("unsupported NavigaMer index version " +
+                             std::to_string(version));
+  }
   NavigaMerIndex index;
   index.window_length = read_value<std::uint32_t>(in);
   index.stride = read_value<std::uint32_t>(in);
@@ -127,7 +150,8 @@ std::uint64_t NavigaMerIndex::bytes() const noexcept {
 
 std::string NavigaMerIndex::summary() const {
   std::ostringstream out;
-  out << "window=" << window_length << " stride=" << stride
+  out << "format_version=" << kIndexFormatVersion
+      << " window=" << window_length << " stride=" << stride
       << " T=" << max_tolerance << " windows=" << reference_window_count
       << " leaf_memberships=" << leaf_ids.size() << '\n';
   for (std::size_t layer = 0; layer < layers.size(); ++layer) {

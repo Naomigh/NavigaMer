@@ -11,6 +11,8 @@
 
 namespace navigamer {
 
+inline constexpr std::uint32_t kIndexFormatVersion = 2;
+
 class NavigaMerIndex {
  public:
   std::uint32_t window_length{0};

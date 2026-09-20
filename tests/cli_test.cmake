@@ -13,7 +13,7 @@ function(run_cli)
 endfunction()
 
 run_cli(build --reference "${TEST_DIR}/reference.fa" --index "${TEST_DIR}/reference.nvm"
-  --window 4 --T 1 --radii 3,3,3 --beacon-ratios 0.5,0.5 --threads 2)
+  --window 4 --T 1 --radii 3,3,3 --beacon-ratios 0.5,0.5,0.5 --threads 2)
 run_cli(inspect --index "${TEST_DIR}/reference.nvm")
 run_cli(query --reference "${TEST_DIR}/reference.fa" --index "${TEST_DIR}/reference.nvm"
   --queries "${TEST_DIR}/queries.fa" --tolerance 1 --threads 2 --output "${TEST_DIR}/hits.tsv")

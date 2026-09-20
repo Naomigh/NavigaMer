@@ -8,8 +8,10 @@
 #include <fstream>
 #include <iomanip>
 #include <iostream>
+#include <limits>
 #include <map>
 #include <numeric>
+#include <stdexcept>
 #include <string>
 #include <sys/resource.h>
 #include <thread>
@@ -53,16 +55,46 @@ std::array<T, N> tuple(const std::string& input) {
   std::size_t begin = 0;
   for (std::size_t i = 0; i < N; ++i) {
     const auto comma = input.find(',', begin);
+    if ((i + 1 < N && comma == std::string::npos) ||
+        (i + 1 == N && comma != std::string::npos)) {
+      throw std::invalid_argument("expected exactly " + std::to_string(N) +
+                                  " comma-separated values: " + input);
+    }
     const auto value = input.substr(begin, comma - begin);
-    if constexpr (std::is_integral_v<T>) result[i] = std::stoul(value);
-    else result[i] = std::stod(value);
-    begin = comma + 1;
+    if (value.empty()) throw std::invalid_argument("empty tuple value: " + input);
+    std::size_t used = 0;
+    if constexpr (std::is_integral_v<T>) {
+      const auto parsed = std::stoull(value, &used);
+      if (parsed > std::numeric_limits<T>::max()) {
+        throw std::out_of_range("tuple value is too large: " + value);
+      }
+      result[i] = static_cast<T>(parsed);
+    } else {
+      result[i] = static_cast<T>(std::stod(value, &used));
+    }
+    if (used != value.size()) {
+      throw std::invalid_argument("invalid tuple value: " + value);
+    }
+    begin = comma == std::string::npos ? input.size() : comma + 1;
   }
   return result;
 }
 
 std::uint32_t worker_count(const Arguments& args, std::uint32_t default_value) {
-  return args.integer("--threads", default_value);
+  const auto value = args.integer("--threads", default_value);
+  if (value == 0 || value > std::numeric_limits<std::uint32_t>::max()) {
+    throw std::invalid_argument("--threads must be a positive 32-bit integer");
+  }
+  return static_cast<std::uint32_t>(value);
+}
+
+std::uint32_t integer32(const Arguments& args, const std::string& key,
+                        std::uint32_t default_value) {
+  const auto value = args.integer(key, default_value);
+  if (value > std::numeric_limits<std::uint32_t>::max()) {
+    throw std::out_of_range(key + " exceeds the 32-bit range");
+  }
+  return static_cast<std::uint32_t>(value);
 }
 
 navigamer::SequenceStore load_reference(const Arguments& args, const NavigaMerIndex& index) {
@@ -78,9 +110,18 @@ std::uint64_t peak_rss_bytes() {
 
 navigamer::QueryConfig query_config(const Arguments& args, const NavigaMerIndex& index) {
   navigamer::QueryConfig config;
-  config.tolerance = args.integer("--tolerance", index.max_tolerance);
-  config.route_mode = args.get("--route", "multilateration") == "scan"
-      ? navigamer::RouteMode::kScan : navigamer::RouteMode::kMultilateration;
+  config.tolerance = integer32(args, "--tolerance", index.max_tolerance);
+  if (config.tolerance > index.max_tolerance) {
+    throw std::invalid_argument("query tolerance exceeds the index build tolerance");
+  }
+  const auto route = args.get("--route", "multilateration");
+  if (route == "multilateration") {
+    config.route_mode = navigamer::RouteMode::kMultilateration;
+  } else if (route == "scan") {
+    config.route_mode = navigamer::RouteMode::kScan;
+  } else {
+    throw std::invalid_argument("--route must be multilateration or scan");
+  }
   config.use_cache = !args.has("--no-cache");
   config.both_strands = args.has("--both-strands");
   config.enable_prefetch = args.has("--prefetch");
@@ -99,6 +140,10 @@ BatchResult run_batch(const NavigaMerIndex& index,
     const std::vector<navigamer::QueryRecord>& records,
     const navigamer::QueryConfig& config, std::uint32_t threads,
     std::uint64_t block_size, std::uint64_t repeat, bool retain_hits) {
+  if (records.empty()) throw std::invalid_argument("query collection must not be empty");
+  if (block_size == 0 || repeat == 0) {
+    throw std::invalid_argument("block size and repeat count must be positive");
+  }
   const auto total = records.size() * repeat;
   BatchResult result;
   if (retain_hits) result.hits.resize(total);
@@ -159,17 +204,43 @@ void print_batch_stats(const BatchResult& result, std::uint64_t queries, std::ui
 
 void command_build(const Arguments& args) {
   auto reference = navigamer::SequenceStore::from_fasta(args.get("--reference"),
-      args.integer("--window", 150), args.integer("--stride", 1), args.integer("--limit", 0));
+      integer32(args, "--window", 150), integer32(args, "--stride", 1),
+      args.integer("--limit", 0));
   navigamer::BuildConfig config;
   config.center_radii = tuple<std::uint32_t, 3>(args.get("--radii", "60,35,15"));
-  config.beacon_ratios = tuple<double, 2>(args.get("--beacon-ratios", "0.1,0.1"));
-  config.max_tolerance = args.integer("--T", 5);
-  config.threads = worker_count(args, std::thread::hardware_concurrency());
+  config.beacon_ratios = tuple<double, 3>(args.get("--beacon-ratios", "0.1,0.1,0.1"));
+  config.max_tolerance = integer32(args, "--T", 5);
+  config.threads = worker_count(
+      args, std::max(1u, std::thread::hardware_concurrency()));
+  navigamer::BuildStats stats;
   const auto start = Clock::now();
-  auto index = navigamer::IndexBuilder::build(reference, config);
+  auto index = navigamer::IndexBuilder::build(reference, config, &stats);
   const auto built = Clock::now();
   index.save(args.get("--index"));
-  std::cout << index.summary()
+  std::cout << std::fixed << std::setprecision(6) << index.summary();
+  constexpr std::array<std::string_view, 3> names{"large", "middle", "small"};
+  for (std::size_t layer = 0; layer < stats.layers.size(); ++layer) {
+    const auto& value = stats.layers[layer];
+    const auto beacon_calls = value.beacon_table_edit_calls +
+                              value.member_beacon_edit_calls;
+    const double pruning_ratio = value.classification_center_pairs == 0 ? 0.0 :
+        static_cast<double>(value.pruned_center_pairs) /
+        static_cast<double>(value.classification_center_pairs);
+    std::cout << "build_layer=" << names[layer]
+        << " center_selection_seconds=" << value.center_selection_seconds
+        << " beacon_table_seconds=" << value.beacon_table_seconds
+        << " classification_seconds=" << value.classification_seconds
+        << " center_edit_calls=" << value.center_edit_calls
+        << " beacon_distance_calls=" << beacon_calls
+        << " beacon_table_distance_calls=" << value.beacon_table_edit_calls
+        << " member_beacon_distance_calls=" << value.member_beacon_edit_calls
+        << " candidate_distance_calls=" << value.candidate_edit_calls
+        << " classification_center_pairs=" << value.classification_center_pairs
+        << " pruned_center_pairs=" << value.pruned_center_pairs
+        << " pruning_ratio=" << pruning_ratio
+        << " classified_members=" << value.classified_members << '\n';
+  }
+  std::cout
       << "build_seconds=" << std::chrono::duration<double>(built - start).count()
       << " save_seconds=" << std::chrono::duration<double>(Clock::now() - built).count()
       << " peak_rss_bytes=" << peak_rss_bytes() << '\n';
@@ -207,7 +278,8 @@ void command_benchmark(const Arguments& args) {
   const auto reference = load_reference(args, index);
   const auto records = navigamer::read_queries(args.get("--queries"), args.integer("--limit", 0));
   const auto config = query_config(args, index);
-  const auto threads = worker_count(args, std::thread::hardware_concurrency());
+  const auto threads = worker_count(
+      args, std::max(1u, std::thread::hardware_concurrency()));
   const auto block = args.integer("--block-size", 64);
   const auto repeat = args.integer("--repeat", 1);
   const auto warmup = args.integer("--warmup", 0);
@@ -264,7 +336,7 @@ int command_verify(const Arguments& args) {
 void usage() {
   std::cout << "NavigaMer\n"
       "  build --reference ref.fa --index out.nvm [--window 150] [--stride 1]"
-      " [--T 5] [--radii 60,35,15] [--beacon-ratios 0.1,0.1] [--threads N]\n"
+      " [--T 5] [--radii 60,35,15] [--beacon-ratios 0.1,0.1,0.1] [--threads N]\n"
       "  query --reference ref.fa --index out.nvm --queries reads.fa"
       " [--tolerance T] [--route multilateration|scan] [--threads N] [--output hits.tsv]\n"
       "  inspect --index out.nvm\n"
@@ -276,13 +348,18 @@ void usage() {
 }  // namespace
 
 int main(int argc, char** argv) {
-  const std::string command = argc == 1 ? "help" : argv[1];
-  const Arguments args(argc, argv);
-  if (command == "build") command_build(args);
-  else if (command == "query") command_query(args);
-  else if (command == "inspect") std::cout << NavigaMerIndex::load(args.get("--index")).summary();
-  else if (command == "verify") return command_verify(args);
-  else if (command == "benchmark") command_benchmark(args);
-  else usage();
-  return 0;
+  try {
+    const std::string command = argc == 1 ? "help" : argv[1];
+    const Arguments args(argc, argv);
+    if (command == "build") command_build(args);
+    else if (command == "query") command_query(args);
+    else if (command == "inspect") std::cout << NavigaMerIndex::load(args.get("--index")).summary();
+    else if (command == "verify") return command_verify(args);
+    else if (command == "benchmark") command_benchmark(args);
+    else usage();
+    return 0;
+  } catch (const std::exception& error) {
+    std::cerr << "error: " << error.what() << '\n';
+    return 1;
+  }
 }
