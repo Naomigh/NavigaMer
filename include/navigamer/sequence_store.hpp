@@ -27,14 +27,18 @@ class SequenceStore {
   [[nodiscard]] std::uint32_t window_length() const noexcept { return window_length_; }
   [[nodiscard]] std::uint32_t stride() const noexcept { return stride_; }
   [[nodiscard]] std::uint64_t size() const noexcept { return sequence_count_; }
+  // Stable non-cryptographic identity of the indexed reference windows/contigs.
+  [[nodiscard]] std::uint64_t fingerprint() const noexcept { return fingerprint_; }
   [[nodiscard]] std::string_view sequence(SequenceId id) const;
   [[nodiscard]] std::pair<std::string_view, std::uint64_t> location(SequenceId id) const;
 
  private:
   [[nodiscard]] const Contig& contig_for(SequenceId id) const;
+  void compute_fingerprint();
   std::uint32_t window_length_{0};
   std::uint32_t stride_{1};
   std::uint64_t sequence_count_{0};
+  std::uint64_t fingerprint_{0};
   std::vector<Contig> contigs_;
 };
 

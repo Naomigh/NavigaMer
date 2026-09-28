@@ -1,9 +1,9 @@
 #pragma once
 
 #include "navigamer/sequence_store.hpp"
+#include "navigamer/packed_centers.hpp"
 #include "navigamer/types.hpp"
 
-#include <array>
 #include <filesystem>
 #include <span>
 #include <string>
@@ -11,7 +11,7 @@
 
 namespace navigamer {
 
-inline constexpr std::uint32_t kIndexFormatVersion = 2;
+inline constexpr std::uint32_t kIndexFormatVersion = 5;
 
 class NavigaMerIndex {
  public:
@@ -19,21 +19,23 @@ class NavigaMerIndex {
   std::uint32_t stride{1};
   std::uint32_t max_tolerance{0};
   std::uint64_t reference_window_count{0};
+  std::uint64_t reference_fingerprint{0};
+  bool uses_shared_reference{true};
   NodeId root{0};
-  std::array<LayerInfo, 3> layers{};
+  std::vector<LayerInfo> layers;
   std::vector<WorldNode> nodes;
-  std::vector<std::string> center_sequences;
+  PackedCenters center_sequences;
   std::vector<NodeId> children;
   std::vector<SequenceId> leaf_ids;
-  // Every leaf owns the actual bases of each member, without compression or sharing.
-  std::vector<std::string> leaf_sequences;
+  // Only populated when reading legacy v3/v4 indexes. New builds store IDs only.
+  std::vector<std::string> legacy_leaf_sequences;
   std::vector<std::uint64_t> beacon_ordinals;
   std::vector<int> beacon_distances;
 
   void save(const std::filesystem::path& path) const;
   static NavigaMerIndex load(const std::filesystem::path& path);
   [[nodiscard]] bool is_leaf(NodeId node) const noexcept {
-    return nodes[node].layer == 2;
+    return nodes[node].layer != kRootLayer && nodes[node].layer + 1u == layers.size();
   }
   [[nodiscard]] std::span<const SequenceId> members(NodeId leaf) const {
     const auto& node = nodes[leaf];
@@ -41,6 +43,11 @@ class NavigaMerIndex {
   }
   [[nodiscard]] std::uint64_t bytes() const noexcept;
   [[nodiscard]] std::string summary() const;
+  [[nodiscard]] std::string_view member_sequence(
+      std::uint64_t member, const SequenceStore& reference) const {
+    return uses_shared_reference ? reference.sequence(leaf_ids[member])
+                                 : std::string_view(legacy_leaf_sequences[member]);
+  }
 };
 
 }  // namespace navigamer

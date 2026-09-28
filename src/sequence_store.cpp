@@ -18,8 +18,14 @@ std::string clean_sequence(std::string_view raw) {
 
 }  // namespace
 
-QueryStats& QueryStats::operator+=(const QueryStats& other) noexcept {
-  for (std::size_t i = 0; i < 3; ++i) {
+QueryStats& QueryStats::operator+=(const QueryStats& other) {
+  const auto count = std::max(route_worlds.size(), other.route_worlds.size());
+  route_worlds.resize(count);
+  route_edit_calls.resize(count);
+  route_candidates.resize(count);
+  route_pruned.resize(count);
+  for (std::size_t i = 0; i < other.route_worlds.size(); ++i) {
+    route_worlds[i] += other.route_worlds[i];
     route_edit_calls[i] += other.route_edit_calls[i];
     route_candidates[i] += other.route_candidates[i];
     route_pruned[i] += other.route_pruned[i];
@@ -70,6 +76,7 @@ SequenceStore SequenceStore::from_fasta(const std::filesystem::path& path,
     }
   }
   finish_contig();
+  store.compute_fingerprint();
   return store;
 }
 
@@ -90,7 +97,34 @@ SequenceStore SequenceStore::from_sequences(std::vector<std::string> sequences) 
     store.contigs_.push_back({"sequence_" + std::to_string(id),
                               clean_sequence(sequences[id]), id, 1});
   }
+  store.compute_fingerprint();
   return store;
+}
+
+void SequenceStore::compute_fingerprint() {
+  // FNV-1a over canonical little-endian lengths and normalized reference text.
+  // Hash each used contig prefix once, not every overlapping window. Unused
+  // tails beyond --limit do not affect the index's reference identity.
+  std::uint64_t hash = 14695981039346656037ULL;
+  auto byte = [&](unsigned char value) { hash = (hash ^ value) * 1099511628211ULL; };
+  auto number = [&](std::uint64_t value) {
+    for (unsigned shift = 0; shift < 64; shift += 8) byte((value >> shift) & 255);
+  };
+  auto text = [&](std::string_view value) {
+    number(value.size());
+    for (const unsigned char c : value) byte(c);
+  };
+  number(window_length_);
+  number(stride_);
+  number(sequence_count_);
+  for (const auto& contig : contigs_) {
+    if (contig.window_count == 0) continue;
+    text(contig.name);
+    number(contig.window_count);
+    const auto used = (contig.window_count - 1) * stride_ + window_length_;
+    text(std::string_view(contig.bases).substr(0, used));
+  }
+  fingerprint_ = hash;
 }
 
 const SequenceStore::Contig& SequenceStore::contig_for(SequenceId id) const {

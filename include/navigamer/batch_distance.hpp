@@ -1,0 +1,47 @@
+#pragma once
+
+#include <array>
+#include <cstddef>
+#include <cstdint>
+#include <string>
+#include <string_view>
+#include <vector>
+
+namespace navigamer {
+
+// Center-prepared Myers profiles, adapted from Minghao's AVX-512 kernel.
+// Four independent 64-bit lanes on AVX2; exact scalar fallback otherwise.
+// Append only between scans. Concurrent readers each need their own workspace.
+class BatchDistance {
+ public:
+  static constexpr std::size_t kLanes = 4;
+  struct alignas(32) Block {
+    std::array<std::uint64_t, kLanes> positive;
+    std::array<std::uint64_t, kLanes> negative;
+  };
+  struct Workspace { std::vector<Block> blocks; };
+
+  explicit BatchDistance(std::size_t length);
+  void append(std::string_view center);
+  // Only the first min(kLanes, size() - group*kLanes) results are valid.
+  [[nodiscard]] std::array<int, kLanes> exact_group(
+      std::string_view target, std::size_t group, Workspace& workspace) const;
+  [[nodiscard]] std::size_t size() const noexcept { return centers_.size(); }
+  [[nodiscard]] static bool simd_available() noexcept;
+
+ private:
+  struct Group {
+    Group() { symbols.fill(256); }
+    std::array<std::uint16_t, 256> symbols;
+    std::size_t alphabet_size = 0;
+    std::vector<std::uint64_t> masks;
+  };
+  [[nodiscard]] std::array<int, kLanes> avx2_group(
+      std::string_view target, std::size_t group, Workspace& workspace) const;
+  std::size_t length_, block_count_;
+  std::uint64_t padding_mask_;
+  std::vector<std::string> centers_;
+  std::vector<Group> groups_;
+};
+
+}  // namespace navigamer

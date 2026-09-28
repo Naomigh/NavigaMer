@@ -3,7 +3,6 @@
 
 #include <algorithm>
 #include <array>
-#include <atomic>
 #include <chrono>
 #include <fstream>
 #include <iomanip>
@@ -49,33 +48,32 @@ class Arguments {
   std::map<std::string, std::string> values_;
 };
 
-template <typename T, std::size_t N>
-std::array<T, N> tuple(const std::string& input) {
-  std::array<T, N> result;
+template <typename T>
+std::vector<T> values_list(const std::string& input) {
+  std::vector<T> result;
   std::size_t begin = 0;
-  for (std::size_t i = 0; i < N; ++i) {
+  for (;;) {
     const auto comma = input.find(',', begin);
-    if ((i + 1 < N && comma == std::string::npos) ||
-        (i + 1 == N && comma != std::string::npos)) {
-      throw std::invalid_argument("expected exactly " + std::to_string(N) +
-                                  " comma-separated values: " + input);
-    }
     const auto value = input.substr(begin, comma - begin);
     if (value.empty()) throw std::invalid_argument("empty tuple value: " + input);
     std::size_t used = 0;
     if constexpr (std::is_integral_v<T>) {
+      if (value.find_first_not_of("0123456789") != std::string::npos) {
+        throw std::invalid_argument("expected unsigned integer: " + value);
+      }
       const auto parsed = std::stoull(value, &used);
       if (parsed > std::numeric_limits<T>::max()) {
         throw std::out_of_range("tuple value is too large: " + value);
       }
-      result[i] = static_cast<T>(parsed);
+      result.push_back(static_cast<T>(parsed));
     } else {
-      result[i] = static_cast<T>(std::stod(value, &used));
+      result.push_back(static_cast<T>(std::stod(value, &used)));
     }
     if (used != value.size()) {
       throw std::invalid_argument("invalid tuple value: " + value);
     }
-    begin = comma == std::string::npos ? input.size() : comma + 1;
+    if (comma == std::string::npos) break;
+    begin = comma + 1;
   }
   return result;
 }
@@ -139,42 +137,36 @@ BatchResult run_batch(const NavigaMerIndex& index,
     const navigamer::SequenceStore& reference,
     const std::vector<navigamer::QueryRecord>& records,
     const navigamer::QueryConfig& config, std::uint32_t threads,
-    std::uint64_t block_size, std::uint64_t repeat, bool retain_hits) {
+    std::uint64_t min_queries, std::uint64_t repeat, bool retain_hits) {
   if (records.empty()) throw std::invalid_argument("query collection must not be empty");
-  if (block_size == 0 || repeat == 0) {
-    throw std::invalid_argument("block size and repeat count must be positive");
+  if (min_queries == 0 || repeat == 0) {
+    throw std::invalid_argument("minimum queries per thread and repeat count must be positive");
   }
   const auto total = records.size() * repeat;
   BatchResult result;
   if (retain_hits) result.hits.resize(total);
   result.latency_ns.resize(total);
-  std::vector<navigamer::QueryStats> thread_stats(threads);
-  std::atomic<std::uint64_t> next{0};
+  std::vector<std::string_view> sequences;
+  sequences.reserve(records.size());
+  for (const auto& record : records) sequences.push_back(record.sequence);
+  navigamer::QueryEngine engine(index, reference);
+  navigamer::PathCache cache;
   const auto start = Clock::now();
-  auto worker = [&](std::uint32_t worker_id) {
-    navigamer::QueryEngine engine(index, reference);
-    navigamer::PathCache cache;
-    while (true) {
-      const auto begin = next.fetch_add(block_size);
-      if (begin >= total) break;
-      const auto end = std::min<std::uint64_t>(total, begin + block_size);
-      for (auto i = begin; i < end; ++i) {
-        navigamer::QueryStats stats;
-        const auto query_start = Clock::now();
-        auto hits = engine.query(records[i % records.size()].sequence, config, &cache, &stats);
-        result.latency_ns[i] = std::chrono::duration_cast<std::chrono::nanoseconds>(
-            Clock::now() - query_start).count();
-        thread_stats[worker_id] += stats;
-        if (retain_hits) result.hits[i] = std::move(hits);
-      }
+  for (std::uint64_t run = 0; run < repeat; ++run) {
+    navigamer::QueryStats stats;
+    const auto query_start = Clock::now();
+    auto hits = engine.query_batch(sequences, config, &cache, &stats,
+                                   {threads, min_queries, retain_hits});
+    const auto elapsed = std::chrono::duration_cast<std::chrono::nanoseconds>(
+        Clock::now() - query_start).count();
+    result.stats += stats;
+    for (std::size_t i = 0; i < records.size(); ++i) {
+      const auto position = run * records.size() + i;
+      result.latency_ns[position] = elapsed;
+      if (retain_hits) result.hits[position] = std::move(hits[i]);
     }
-  };
-  std::vector<std::thread> workers;
-  for (std::uint32_t i = 1; i < threads; ++i) workers.emplace_back(worker, i);
-  worker(0);
-  for (auto& thread : workers) thread.join();
+  }
   result.seconds = std::chrono::duration<double>(Clock::now() - start).count();
-  for (const auto& stats : thread_stats) result.stats += stats;
   return result;
 }
 
@@ -191,6 +183,7 @@ void print_batch_stats(const BatchResult& result, std::uint64_t queries, std::ui
   std::cout << std::fixed << std::setprecision(3)
       << "queries=" << queries << " threads=" << threads
       << " wall_seconds=" << result.seconds << " throughput_qps=" << queries / result.seconds
+      << " latency_scope=collection_completion"
       << " mean_latency_us=" << static_cast<double>(sum / queries / 1000)
       << " p50_us=" << percentile(result.latency_ns, 0.50)
       << " p95_us=" << percentile(result.latency_ns, 0.95)
@@ -199,19 +192,49 @@ void print_batch_stats(const BatchResult& result, std::uint64_t queries, std::ui
       << "avg_route_edits=" << static_cast<double>(stats.routing_edit_calls()) / queries
       << " avg_exact_verifications=" << static_cast<double>(stats.exact_verifications) / queries
       << " avg_leaf_members=" << static_cast<double>(stats.leaf_members) / queries
-      << " avg_cache_candidates=" << static_cast<double>(stats.cache_candidates) / queries << '\n';
+      << " avg_cache_candidates=" << static_cast<double>(stats.cache_candidates) / queries << '\n'
+      << "route_worlds=";
+  for (std::size_t layer = 0; layer < stats.route_worlds.size(); ++layer) {
+    if (layer != 0) std::cout << ',';
+    std::cout << stats.route_worlds[layer];
+  }
+  std::cout << '\n';
 }
 
 void command_build(const Arguments& args) {
-  auto reference = navigamer::SequenceStore::from_fasta(args.get("--reference"),
-      integer32(args, "--window", 150), integer32(args, "--stride", 1),
-      args.integer("--limit", 0));
   navigamer::BuildConfig config;
-  config.center_radii = tuple<std::uint32_t, 3>(args.get("--radii", "60,35,15"));
-  config.beacon_ratios = tuple<double, 3>(args.get("--beacon-ratios", "0.1,0.1,0.1"));
+  config.center_radii = values_list<std::uint32_t>(args.get("--radii", "60,35,15"));
+  const auto layer_count = config.center_radii.size();
+  if (layer_count == 0 || layer_count > navigamer::kRootLayer) {
+    throw std::invalid_argument("layer count must be between 1 and 255");
+  }
+  if (args.has("--layers")) {
+    const auto layers = values_list<std::uint32_t>(args.get("--layers"));
+    if (layers.size() != 1 || layers[0] != layer_count) {
+      throw std::invalid_argument("--layers must match the number of --radii values (1..255)");
+    }
+  }
+  if (args.has("--beacon-ratios")) {
+    config.beacon_ratios = values_list<double>(args.get("--beacon-ratios"));
+    if (config.beacon_ratios.size() != layer_count) {
+      throw std::invalid_argument("--beacon-ratios requires one value per layer");
+    }
+  }
+  if (args.has("--beacon-cover-radii")) {
+    if (args.has("--beacon-ratios")) {
+      throw std::invalid_argument("choose --beacon-cover-radii or --beacon-ratios, not both");
+    }
+    config.beacon_cover_radii = values_list<std::uint32_t>(args.get("--beacon-cover-radii"));
+    if (config.beacon_cover_radii->size() != layer_count) {
+      throw std::invalid_argument("--beacon-cover-radii requires one value per layer");
+    }
+  }
   config.max_tolerance = integer32(args, "--T", 5);
   config.threads = worker_count(
       args, std::max(1u, std::thread::hardware_concurrency()));
+  auto reference = navigamer::SequenceStore::from_fasta(args.get("--reference"),
+      integer32(args, "--window", 150), integer32(args, "--stride", 1),
+      args.integer("--limit", 0));
   navigamer::BuildStats stats;
   const auto start = Clock::now();
   auto index = navigamer::IndexBuilder::build(reference, config, &stats);
@@ -226,15 +249,22 @@ void command_build(const Arguments& args) {
     const double pruning_ratio = value.classification_center_pairs == 0 ? 0.0 :
         static_cast<double>(value.pruned_center_pairs) /
         static_cast<double>(value.classification_center_pairs);
-    std::cout << "build_layer=" << names[layer]
+    std::cout << "build_layer=" << (layer_count == 3 ? std::string(names[layer]) : std::to_string(layer))
+        << " layer_index=" << layer
         << " center_selection_seconds=" << value.center_selection_seconds
         << " beacon_table_seconds=" << value.beacon_table_seconds
         << " classification_seconds=" << value.classification_seconds
         << " center_edit_calls=" << value.center_edit_calls
+        << " center_bound_accepts=" << value.center_bound_accepts
+        << " center_hint_hits=" << value.center_hint_hits
+        << " center_batch_groups=" << value.center_batch_groups
+        << " beacon_selection_edit_calls=" << value.beacon_selection_edit_calls
+        << " selected_beacons=" << value.selected_beacons
         << " beacon_distance_calls=" << beacon_calls
         << " beacon_table_distance_calls=" << value.beacon_table_edit_calls
         << " member_beacon_distance_calls=" << value.member_beacon_edit_calls
         << " candidate_distance_calls=" << value.candidate_edit_calls
+        << " candidate_batch_groups=" << value.candidate_batch_groups
         << " classification_center_pairs=" << value.classification_center_pairs
         << " pruned_center_pairs=" << value.pruned_center_pairs
         << " pruning_ratio=" << pruning_ratio
@@ -246,13 +276,20 @@ void command_build(const Arguments& args) {
       << " peak_rss_bytes=" << peak_rss_bytes() << '\n';
 }
 
+std::uint64_t min_queries_per_thread(const Arguments& args) {
+  if (args.has("--min-queries-per-thread") && args.has("--block-size")) {
+    throw std::invalid_argument("use --min-queries-per-thread or its --block-size alias, not both");
+  }
+  return args.integer("--min-queries-per-thread", args.integer("--block-size", 1));
+}
+
 void command_query(const Arguments& args) {
   const auto index = NavigaMerIndex::load(args.get("--index"));
   const auto reference = load_reference(args, index);
   const auto records = navigamer::read_queries(args.get("--queries"), args.integer("--limit", 0));
   const auto threads = worker_count(args, 1);
   const auto result = run_batch(index, reference, records, query_config(args, index), threads,
-      args.integer("--block-size", 64), 1, !args.has("--no-output"));
+      min_queries_per_thread(args), 1, !args.has("--no-output"));
   if (!args.has("--no-output")) {
     std::ofstream file;
     std::ostream* out = &std::cout;
@@ -280,15 +317,15 @@ void command_benchmark(const Arguments& args) {
   const auto config = query_config(args, index);
   const auto threads = worker_count(
       args, std::max(1u, std::thread::hardware_concurrency()));
-  const auto block = args.integer("--block-size", 64);
+  const auto min_queries = min_queries_per_thread(args);
   const auto repeat = args.integer("--repeat", 1);
   const auto warmup = args.integer("--warmup", 0);
   if (warmup != 0) {
     const auto count = std::min<std::uint64_t>(warmup, records.size());
     const std::vector<navigamer::QueryRecord> warm(records.begin(), records.begin() + count);
-    run_batch(index, reference, warm, config, threads, block, 1, false);
+    run_batch(index, reference, warm, config, threads, min_queries, 1, false);
   }
-  const auto result = run_batch(index, reference, records, config, threads, block, repeat, false);
+  const auto result = run_batch(index, reference, records, config, threads, min_queries, repeat, false);
   print_batch_stats(result, records.size() * repeat, threads);
 }
 
@@ -336,13 +373,16 @@ int command_verify(const Arguments& args) {
 void usage() {
   std::cout << "NavigaMer\n"
       "  build --reference ref.fa --index out.nvm [--window 150] [--stride 1]"
-      " [--T 5] [--radii 60,35,15] [--beacon-ratios 0.1,0.1,0.1] [--threads N]\n"
+      " [--T 5] [--layers N] [--radii R1,...,RN]"
+      " [--beacon-ratios B1,...,BN | --beacon-cover-radii C1,...,CN] [--threads N]\n"
+      "    Defaults: 3 layers, radii 60,35,15, beacon ratio 0.1 per layer.\n"
       "  query --reference ref.fa --index out.nvm --queries reads.fa"
-      " [--tolerance T] [--route multilateration|scan] [--threads N] [--output hits.tsv]\n"
+      " [--tolerance T] [--route multilateration|scan] [--threads N]"
+      " [--min-queries-per-thread N] [--output hits.tsv]\n"
       "  inspect --index out.nvm\n"
       "  verify --reference ref.fa --index out.nvm --queries reads.fa [--limit 100]\n"
       "  benchmark --reference ref.fa --index out.nvm --queries reads.fa"
-      " [--repeat N] [--warmup N] [--threads N]\n";
+      " [--repeat N] [--warmup N] [--threads N] [--min-queries-per-thread N]\n";
 }
 
 }  // namespace

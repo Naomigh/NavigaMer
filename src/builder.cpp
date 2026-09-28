@@ -1,8 +1,12 @@
 #include "navigamer/builder.hpp"
 
+#include "navigamer/batch_distance.hpp"
 #include "navigamer/edit_distance.hpp"
+#include "navigamer/prefetch.hpp"
 
 #include <algorithm>
+#include <atomic>
+#include <barrier>
 #include <chrono>
 #include <cmath>
 #include <limits>
@@ -36,6 +40,7 @@ struct TempSplit {
 struct CenterSelection {
   std::vector<SequenceId> ids;
   std::vector<std::size_t> member_ordinals;
+  PackedCenters sequences;
 };
 
 std::size_t active_workers(std::size_t count, std::uint32_t requested) {
@@ -59,47 +64,191 @@ void parallel_workers(std::size_t count, std::uint32_t requested,
 CenterSelection choose_centers(const SequenceStore& reference,
                                const std::vector<SequenceId>& members,
                                std::uint32_t radius,
-                               LayerBuildStats& stats) {
-  CenterSelection selected{{members[0]}, {0}};
-  for (std::size_t i = 1; i < members.size(); ++i) {
-    bool covered = false;
-    for (const auto center : selected.ids) {
-      ++stats.center_edit_calls;
-      if (EditDistance::exact(reference.sequence(members[i]),
-                              reference.sequence(center)) <=
-          static_cast<int>(radius)) {
-        covered = true;
-        break;
+                               LayerBuildStats& stats, std::uint32_t threads = 1) {
+  CenterSelection selected{{members[0]}, {0}, PackedCenters(reference.window_length())};
+  selected.sequences.append(reference.sequence(members[0]));
+  if (radius >= reference.window_length()) return selected;
+  const bool use_batch = radius > EditDistance::kLeapMaxDistance && BatchDistance::simd_available();
+  BatchDistance batch(reference.window_length());
+  if (use_batch) batch.append(reference.sequence(members[0]));
+  struct Hint {
+    std::size_t center = std::numeric_limits<std::size_t>::max();
+    std::uint32_t upper = 0;
+    std::pair<std::string_view, std::uint64_t> location;
+  };
+  auto covered = [&](std::size_t i, std::size_t first, std::size_t last,
+                     Hint& hint, std::string& scratch, BatchDistance::Workspace& workspace,
+                     LayerBuildStats& local) {
+    if (first == last) return false;
+    const bool valid_hint = hint.center >= first && hint.center < last;
+    const auto location = reference.location(members[i]);
+    // Same-contig windows separated by s bases differ by at most 2s edits.
+    // Compare name addresses, not text: distinct contigs can share a name.
+    if (valid_hint && location.first.data() == hint.location.first.data()) {
+      const auto shift = location.second >= hint.location.second
+          ? location.second - hint.location.second : hint.location.second - location.second;
+      if (shift <= (radius - hint.upper) / 2) {
+        hint.upper += 2 * shift;
+        hint.location = location;
+        ++local.center_bound_accepts;
+        return true;
       }
     }
-    if (!covered) {
-      selected.ids.push_back(members[i]);
-      selected.member_ordinals.push_back(i);
+    const auto sequence = reference.sequence(members[i]);
+    PreparedQuery query(sequence);
+    if (valid_hint) {
+      ++local.center_edit_calls;
+      const auto d = query.distance(selected.sequences, hint.center, scratch, radius);
+      if (d >= 0) {
+        hint.upper = d;
+        hint.location = location;
+        ++local.center_hint_hits;
+        return true;
+      }
     }
+    for (std::size_t c = first; c < last; ++c) {
+      if (use_batch && c % BatchDistance::kLanes == 0 && last - c >= BatchDistance::kLanes) {
+        const auto distances = batch.exact_group(sequence, c / BatchDistance::kLanes, workspace);
+        local.center_edit_calls += BatchDistance::kLanes;
+        ++local.center_batch_groups;
+        for (std::size_t lane = 0; lane < BatchDistance::kLanes; ++lane) {
+          if (distances[lane] <= static_cast<int>(radius)) {
+            hint = {c + lane, static_cast<std::uint32_t>(distances[lane]), location};
+            return true;
+          }
+        }
+        c += BatchDistance::kLanes - 1;
+        continue;
+      }
+      if (valid_hint && c == hint.center) continue;
+      ++local.center_edit_calls;
+      const auto d = query.distance(selected.sequences, c, scratch, radius);
+      if (d >= 0) {
+        hint = {c, static_cast<std::uint32_t>(d), location};
+        return true;
+      }
+    }
+    return false;
+  };
+  auto append = [&](std::size_t i, Hint& hint) {
+    selected.ids.push_back(members[i]);
+    selected.member_ordinals.push_back(i);
+    selected.sequences.append(reference.sequence(members[i]));
+    if (use_batch) batch.append(reference.sequence(members[i]));
+    hint = {selected.ids.size() - 1, 0, reference.location(members[i])};
+  };
+  Hint serial_hint{0, 0, reference.location(members[0])};
+  std::string serial_scratch;
+  BatchDistance::Workspace serial_workspace;
+  constexpr std::size_t batch_size = 4096;
+  if (threads == 1 || members.size() < batch_size) {
+    for (std::size_t i = 1; i < members.size(); ++i) {
+      if (!covered(i, 0, selected.ids.size(), serial_hint, serial_scratch, serial_workspace, stats)) {
+        append(i, serial_hint);
+      }
+    }
+    return selected;
+  }
+
+  // Workers check an immutable center snapshot. Only the serial merge adds
+  // centers, in input order, after checking survivors against newly added ones.
+  const auto worker_count = active_workers(batch_size, threads);
+  std::vector<Hint> hints(worker_count);
+  std::vector<std::string> scratch(worker_count);
+  std::vector<BatchDistance::Workspace> workspaces(worker_count);
+  std::vector<LayerBuildStats> worker_stats(worker_count);
+  std::vector<std::uint8_t> accepted(batch_size);
+  std::barrier sync(static_cast<std::ptrdiff_t>(worker_count));
+  std::size_t begin = 1, end = 1, snapshot_count = 0;
+  bool stop = false;
+  auto scan = [&](std::size_t worker) {
+    const auto first = begin + (end - begin) * worker / worker_count;
+    const auto last = begin + (end - begin) * (worker + 1) / worker_count;
+    for (auto i = first; i < last; ++i) {
+      accepted[i - begin] = covered(i, 0, snapshot_count, hints[worker],
+                                    scratch[worker], workspaces[worker], worker_stats[worker]);
+    }
+  };
+  std::vector<std::thread> workers;
+  for (std::size_t worker = 1; worker < worker_count; ++worker) {
+    workers.emplace_back([&, worker] {
+      for (;;) {
+        sync.arrive_and_wait();
+        if (stop) return;
+        scan(worker);
+        sync.arrive_and_wait();
+      }
+    });
+  }
+  for (; begin < members.size(); begin = end) {
+    end = begin + std::min(batch_size, members.size() - begin);
+    snapshot_count = selected.ids.size();
+    sync.arrive_and_wait();
+    scan(0);
+    sync.arrive_and_wait();
+    for (auto i = begin; i < end; ++i) {
+      if (!accepted[i - begin] &&
+          !covered(i, snapshot_count, selected.ids.size(), serial_hint, serial_scratch, serial_workspace, stats)) {
+        append(i, serial_hint);
+      }
+    }
+  }
+  stop = true;
+  sync.arrive_and_wait();
+  for (auto& worker : workers) worker.join();
+  for (const auto& local : worker_stats) {
+    stats.center_edit_calls += local.center_edit_calls;
+    stats.center_bound_accepts += local.center_bound_accepts;
+    stats.center_hint_hits += local.center_hint_hits;
+    stats.center_batch_groups += local.center_batch_groups;
   }
   return selected;
 }
 
-TempBeaconTable make_beacon_table(const SequenceStore& reference,
-                                  const std::vector<SequenceId>& centers,
+TempBeaconTable make_beacon_table(const PackedCenters& centers,
                                   double ratio, std::uint32_t threads,
-                                  LayerBuildStats& stats) {
+                                  LayerBuildStats& stats,
+                                  std::optional<std::uint32_t> cover_radius) {
   TempBeaconTable table;
-  const auto beacon_count = static_cast<std::size_t>(
-      std::ceil(ratio * static_cast<double>(centers.size())));
-  if (beacon_count == 0) return table;
-  table.ordinals.reserve(beacon_count);
-  for (std::size_t b = 0; b < beacon_count; ++b) {
-    table.ordinals.push_back(b * centers.size() / beacon_count);
+  if (cover_radius) {
+    std::string center_scratch, anchor_scratch;
+    for (std::size_t c = 0; c < centers.size(); ++c) {
+      const auto sequence = centers.decode(c, center_scratch);
+      PreparedQuery query(sequence);
+      bool covered = false;
+      for (const auto anchor : table.ordinals) {
+        ++stats.beacon_selection_edit_calls;
+        if (query.distance(centers, anchor, anchor_scratch, *cover_radius) >= 0) {
+          covered = true;
+          break;
+        }
+      }
+      if (!covered) table.ordinals.push_back(c);
+    }
+  } else {
+    const auto count = static_cast<std::size_t>(
+        std::ceil(ratio * static_cast<double>(centers.size())));
+    table.ordinals.reserve(count);
+    for (std::size_t b = 0; b < count; ++b) {
+      table.ordinals.push_back(b * centers.size() / count);
+    }
   }
+  const auto beacon_count = table.ordinals.size();
+  stats.selected_beacons += beacon_count;
+  if (beacon_count == 0) return table;
   table.distances.resize(centers.size() * beacon_count);
   parallel_workers(centers.size(), threads,
                    [&](std::size_t worker, std::size_t worker_count) {
-    for (std::size_t row = worker; row < centers.size(); row += worker_count) {
+    std::string row_scratch, beacon_scratch;
+    centers.prefetch(0, centers.size());
+    const auto begin = centers.size() * worker / worker_count;
+    const auto end = centers.size() * (worker + 1) / worker_count;
+    for (std::size_t row = begin; row < end; ++row) {
+      const auto sequence = centers.decode(row, row_scratch);
+      PreparedQuery query(sequence);
       for (std::size_t b = 0; b < beacon_count; ++b) {
-        table.distances[row * beacon_count + b] = EditDistance::exact(
-            reference.sequence(centers[row]),
-            reference.sequence(centers[table.ordinals[b]]));
+        table.distances[row * beacon_count + b] =
+            query.distance(centers, table.ordinals[b], beacon_scratch);
       }
     }
   });
@@ -110,82 +259,125 @@ TempBeaconTable make_beacon_table(const SequenceStore& reference,
 struct WorkerClassificationStats {
   std::uint64_t member_beacon_edit_calls{0};
   std::uint64_t candidate_edit_calls{0};
+  std::uint64_t candidate_batch_groups{0};
   std::uint64_t center_pairs{0};
   std::uint64_t pruned_pairs{0};
   std::uint64_t members{0};
 };
 
-std::vector<std::vector<std::size_t>> classify_members(
+std::vector<std::vector<SequenceId>> classify_members(
     const SequenceStore& reference, const std::vector<SequenceId>& members,
     const CenterSelection& centers, const TempBeaconTable& table,
     const BuildConfig& config, LayerBuildStats& stats) {
+  const bool use_batch = BatchDistance::simd_available();
+  BatchDistance batch(reference.window_length());
+  if (use_batch) {
+    for (const auto id : centers.ids) batch.append(reference.sequence(id));
+  }
   const auto no_center = std::numeric_limits<std::size_t>::max();
   std::vector<std::size_t> exclusive_world(members.size(), no_center);
   for (std::size_t c = 0; c < centers.ids.size(); ++c) {
     exclusive_world[centers.member_ordinals[c]] = c;
   }
 
-  std::vector<std::vector<std::size_t>> assignments(members.size());
   const auto worker_count = active_workers(members.size(), config.threads);
+  // Each worker streams one contiguous member range into its own child buckets.
+  // Merging ranges in worker order preserves the original membership order.
+  std::vector<std::vector<std::vector<SequenceId>>> worker_buckets(
+      worker_count, std::vector<std::vector<SequenceId>>(centers.ids.size()));
   std::vector<WorkerClassificationStats> worker_stats(worker_count);
   parallel_workers(members.size(), config.threads,
                    [&](std::size_t worker, std::size_t workers) {
     auto& local = worker_stats[worker];
-    std::vector<int> distances(centers.ids.size());
-    std::vector<int> query_beacon_distances(table.ordinals.size());
-    for (std::size_t i = worker; i < members.size(); i += workers) {
-      if (exclusive_world[i] != no_center) {
-        assignments[i].push_back(exclusive_world[i]);
-        continue;
-      }
-
-      ++local.members;
-      local.center_pairs += centers.ids.size();
+    auto& buckets = worker_buckets[worker];
+    BatchDistance::Workspace workspace;
+    std::string center_scratch;
+    const auto begin = members.size() * worker / workers;
+    const auto end = members.size() * (worker + 1) / workers;
+    const auto nc = centers.ids.size(), nb = table.ordinals.size();
+    constexpr std::size_t query_tile = 8, center_tile = 32;
+    std::array<std::string_view, query_tile> sequences;
+    std::vector<int> distances(query_tile * nc), anchors(query_tile * nb);
+    std::vector<int> upper(query_tile);
+    std::vector<PreparedQuery> queries;
+    queries.reserve(query_tile);
+    for (auto start = begin; start < end; start += query_tile) {
+      const auto count = std::min(query_tile, end - start);
+      queries.clear();
       std::fill(distances.begin(), distances.end(), -1);
-      const auto sequence = reference.sequence(members[i]);
-      int upper_bound = std::numeric_limits<int>::max();
-      for (std::size_t b = 0; b < table.ordinals.size(); ++b) {
-        const auto ordinal = table.ordinals[b];
-        const int distance = EditDistance::exact(
-            sequence, reference.sequence(centers.ids[ordinal]));
-        query_beacon_distances[b] = distance;
-        distances[ordinal] = distance;
-        upper_bound = std::min(upper_bound, distance);
-        ++local.member_beacon_edit_calls;
+      std::fill(upper.begin(), upper.end(), std::numeric_limits<int>::max());
+      for (std::size_t q = 0; q < count; ++q) {
+        sequences[q] = reference.sequence(members[start + q]);
+        queries.emplace_back(sequences[q]);
+        if (exclusive_world[start + q] != no_center) continue;
+        ++local.members;
+        local.center_pairs += nc;
+        for (std::size_t b = 0; b < nb; ++b) {
+          const auto c = table.ordinals[b];
+          const auto d = queries[q].distance(centers.sequences, c, center_scratch);
+          anchors[q * nb + b] = distances[q * nc + c] = d;
+          upper[q] = std::min(upper[q], d);
+          ++local.member_beacon_edit_calls;
+        }
       }
-
-      for (std::size_t c = 0; c < centers.ids.size(); ++c) {
-        if (distances[c] >= 0) continue;
-        if (!table.ordinals.empty()) {
-          int lower_bound = 0;
-          for (std::size_t b = 0; b < table.ordinals.size(); ++b) {
-            lower_bound = std::max(
-                lower_bound,
-                std::abs(query_beacon_distances[b] -
-                         table.distances[c * table.ordinals.size() + b]));
-          }
-          if (lower_bound >
-              upper_bound + 2 * static_cast<int>(config.max_tolerance)) {
-            ++local.pruned_pairs;
-            continue;
+      // A small center block is reused by all queries before moving on.
+      for (std::size_t first = 0; first < nc; first += center_tile) {
+        const auto last = std::min(nc, first + center_tile);
+        centers.sequences.prefetch(first, last - first);
+        for (std::size_t q = 0; q < count; ++q) {
+          if (exclusive_world[start + q] != no_center) continue;
+          for (auto c = first; c < last; ++c) {
+            // Batch only complete, uncomputed groups with no pruned lanes.
+            // Small bounds keep LEAP; isolated candidates keep scalar Edlib.
+            const int group_limit = upper[q] == std::numeric_limits<int>::max()
+                ? -1 : upper[q] + 2 * static_cast<int>(config.max_tolerance);
+            if (use_batch && c % BatchDistance::kLanes == 0 &&
+                last - c >= BatchDistance::kLanes &&
+                (group_limit < 0 || group_limit > EditDistance::kLeapMaxDistance)) {
+              bool eligible = true;
+              for (std::size_t lane = 0; lane < BatchDistance::kLanes && eligible; ++lane) {
+                eligible = distances[q * nc + c + lane] < 0;
+                for (std::size_t b = 0; b < nb && eligible && group_limit >= 0; ++b) {
+                  eligible = std::abs(anchors[q * nb + b] - table.distances[(c + lane) * nb + b]) <= group_limit;
+                }
+              }
+              if (eligible) {
+                const auto values = batch.exact_group(sequences[q], c / BatchDistance::kLanes, workspace);
+                for (std::size_t lane = 0; lane < BatchDistance::kLanes; ++lane) {
+                  distances[q * nc + c + lane] = values[lane];
+                  upper[q] = std::min(upper[q], values[lane]);
+                }
+                local.candidate_edit_calls += BatchDistance::kLanes;
+                ++local.candidate_batch_groups;
+                c += BatchDistance::kLanes - 1;
+                continue;
+              }
+            }
+            auto& d = distances[q * nc + c];
+            if (d >= 0) continue;
+            int lower = 0;
+            for (std::size_t b = 0; b < nb; ++b) {
+              lower = std::max(lower, std::abs(anchors[q * nb + b] - table.distances[c * nb + b]));
+            }
+            const int limit = upper[q] == std::numeric_limits<int>::max()
+                ? -1 : upper[q] + 2 * static_cast<int>(config.max_tolerance);
+            if (limit >= 0 && lower > limit) { ++local.pruned_pairs; continue; }
+            d = queries[q].distance(centers.sequences, c, center_scratch, limit);
+            if (d >= 0) upper[q] = std::min(upper[q], d);
+            ++local.candidate_edit_calls;
           }
         }
-        distances[c] = EditDistance::exact(
-            sequence, reference.sequence(centers.ids[c]));
-        ++local.candidate_edit_calls;
       }
-
-      const int nearest = *std::min_element(
-          distances.begin(), distances.end(), [](int lhs, int rhs) {
-            if (lhs < 0) return false;
-            if (rhs < 0) return true;
-            return lhs < rhs;
-          });
-      const int assignment_limit =
-          nearest + 2 * static_cast<int>(config.max_tolerance);
-      for (std::size_t c = 0; c < centers.ids.size(); ++c) {
-        if (distances[c] >= 0 && distances[c] <= assignment_limit) {
-          assignments[i].push_back(c);
+      for (std::size_t q = 0; q < count; ++q) {
+        const auto i = start + q;
+        if (exclusive_world[i] != no_center) {
+          buckets[exclusive_world[i]].push_back(members[i]);
+          continue;
+        }
+        const int limit = upper[q] + 2 * static_cast<int>(config.max_tolerance);
+        for (std::size_t c = 0; c < nc; ++c) {
+          const int d = distances[q * nc + c];
+          if (d >= 0 && d <= limit) buckets[c].push_back(members[i]);
         }
       }
     }
@@ -193,44 +385,51 @@ std::vector<std::vector<std::size_t>> classify_members(
   for (const auto& local : worker_stats) {
     stats.member_beacon_edit_calls += local.member_beacon_edit_calls;
     stats.candidate_edit_calls += local.candidate_edit_calls;
+    stats.candidate_batch_groups += local.candidate_batch_groups;
     stats.classification_center_pairs += local.center_pairs;
     stats.pruned_center_pairs += local.pruned_pairs;
     stats.classified_members += local.members;
   }
-  return assignments;
+  std::vector<std::vector<SequenceId>> buckets(centers.ids.size());
+  for (std::size_t c = 0; c < centers.ids.size(); ++c) {
+    std::size_t count = 0;
+    for (const auto& local : worker_buckets) count += local[c].size();
+    buckets[c].reserve(count);
+    for (const auto& local : worker_buckets) {
+      buckets[c].insert(buckets[c].end(), local[c].begin(), local[c].end());
+    }
+  }
+  return buckets;
 }
 
 TempSplit split_parent(const SequenceStore& reference,
                        const std::vector<SequenceId>& members,
-                       std::uint32_t radius, double beacon_ratio,
+                       std::size_t layer,
                        const BuildConfig& config, LayerBuildStats& stats) {
   const auto center_start = Clock::now();
-  auto centers = choose_centers(reference, members, radius, stats);
+  auto centers = choose_centers(reference, members, config.center_radii[layer], stats, config.threads);
   stats.center_selection_seconds +=
       std::chrono::duration<double>(Clock::now() - center_start).count();
 
   const auto beacon_start = Clock::now();
-  auto table = make_beacon_table(reference, centers.ids, beacon_ratio,
-                                 config.threads, stats);
+  const auto cover_radius = config.beacon_cover_radii
+      ? std::optional<std::uint32_t>((*config.beacon_cover_radii)[layer]) : std::nullopt;
+  const auto ratio = config.beacon_ratios.empty() ? 0.1 : config.beacon_ratios[layer];
+  auto table = make_beacon_table(centers.sequences, ratio,
+                                 config.threads, stats, cover_radius);
   stats.beacon_table_seconds +=
       std::chrono::duration<double>(Clock::now() - beacon_start).count();
 
   const auto classification_start = Clock::now();
-  auto assignments = classify_members(reference, members, centers, table,
-                                      config, stats);
+  auto buckets = classify_members(reference, members, centers, table, config, stats);
   stats.classification_seconds +=
       std::chrono::duration<double>(Clock::now() - classification_start).count();
 
   TempSplit result;
   result.beacons = std::move(table);
   result.worlds.reserve(centers.ids.size());
-  for (const auto center : centers.ids) {
-    result.worlds.push_back({center, {}, {}, {}, 0});
-  }
-  for (std::size_t i = 0; i < members.size(); ++i) {
-    for (const auto world : assignments[i]) {
-      result.worlds[world].members.push_back(members[i]);
-    }
+  for (std::size_t c = 0; c < centers.ids.size(); ++c) {
+    result.worlds.push_back({centers.ids[c], std::move(buckets[c]), {}, {}, 0});
   }
   for (auto& world : result.worlds) world.member_count = world.members.size();
   return result;
@@ -259,6 +458,16 @@ NavigaMerIndex IndexBuilder::build(const SequenceStore& reference,
   if (config.threads == 0) {
     throw std::invalid_argument("build thread count must be positive");
   }
+  const auto layer_count = config.center_radii.size();
+  if (layer_count == 0 || layer_count > kRootLayer) {
+    throw std::invalid_argument("layer count must be between 1 and 255");
+  }
+  if (!config.beacon_ratios.empty() && config.beacon_ratios.size() != layer_count) {
+    throw std::invalid_argument("beacon ratios must contain one value per layer");
+  }
+  if (config.beacon_cover_radii && config.beacon_cover_radii->size() != layer_count) {
+    throw std::invalid_argument("beacon cover radii must contain one value per layer");
+  }
   for (const double ratio : config.beacon_ratios) {
     if (!std::isfinite(ratio) || ratio < 0.0 || ratio > 1.0) {
       throw std::invalid_argument("beacon ratios must be between 0 and 1");
@@ -267,39 +476,61 @@ NavigaMerIndex IndexBuilder::build(const SequenceStore& reference,
   BuildStats local_stats;
   BuildStats& stats = build_stats ? *build_stats : local_stats;
   stats = {};
+  stats.layers.resize(layer_count);
 
   std::vector<SequenceId> all(reference.size());
   std::iota(all.begin(), all.end(), 0);
-  auto large_split = split_parent(reference, all, config.center_radii[0],
-                                  config.beacon_ratios[0], config,
-                                  stats.layers[0]);
+  auto large_split = split_parent(reference, all, 0, config, stats.layers[0]);
   auto root_beacons = std::move(large_split.beacons);
-  auto large = std::move(large_split.worlds);
+  std::vector<std::vector<TempWorld>> worlds(layer_count);
+  worlds[0] = std::move(large_split.worlds);
 
-  std::vector<TempWorld> middle;
-  for (auto& parent : large) {
-    auto split = split_parent(reference, parent.members,
-                              config.center_radii[1], config.beacon_ratios[1],
-                              config, stats.layers[1]);
-    parent.child_beacons = std::move(split.beacons);
-    for (auto& child : split.worlds) {
-      parent.children.push_back(middle.size());
-      middle.push_back(std::move(child));
+  auto split_layer = [&](std::vector<TempWorld>& parents, std::size_t layer) {
+    std::vector<TempSplit> splits(parents.size());
+    std::vector<LayerBuildStats> parent_stats(parents.size());
+    std::atomic<std::size_t> next{0};
+    auto inner_config = config;
+    inner_config.threads = config.threads / active_workers(parents.size(), config.threads);
+    parallel_workers(parents.size(), config.threads, [&](std::size_t, std::size_t) {
+      for (;;) {
+        const auto i = next.fetch_add(1, std::memory_order_relaxed);
+        if (i >= parents.size()) break;
+        splits[i] = split_parent(reference, parents[i].members, layer,
+                                 inner_config, parent_stats[i]);
+        std::vector<SequenceId>{}.swap(parents[i].members);
+      }
+    });
+    std::vector<TempWorld> children;
+    auto& total = stats.layers[layer];
+    for (std::size_t i = 0; i < parents.size(); ++i) {
+      auto& parent = parents[i];
+      parent.child_beacons = std::move(splits[i].beacons);
+      for (auto& child : splits[i].worlds) {
+        parent.children.push_back(children.size());
+        children.push_back(std::move(child));
+      }
+      const auto& s = parent_stats[i];
+      total.center_selection_seconds += s.center_selection_seconds;
+      total.beacon_table_seconds += s.beacon_table_seconds;
+      total.classification_seconds += s.classification_seconds;
+      total.center_edit_calls += s.center_edit_calls;
+      total.center_bound_accepts += s.center_bound_accepts;
+      total.center_hint_hits += s.center_hint_hits;
+      total.center_batch_groups += s.center_batch_groups;
+      total.beacon_selection_edit_calls += s.beacon_selection_edit_calls;
+      total.selected_beacons += s.selected_beacons;
+      total.beacon_table_edit_calls += s.beacon_table_edit_calls;
+      total.member_beacon_edit_calls += s.member_beacon_edit_calls;
+      total.candidate_edit_calls += s.candidate_edit_calls;
+      total.candidate_batch_groups += s.candidate_batch_groups;
+      total.classification_center_pairs += s.classification_center_pairs;
+      total.pruned_center_pairs += s.pruned_center_pairs;
+      total.classified_members += s.classified_members;
     }
-    std::vector<SequenceId>{}.swap(parent.members);
-  }
-
-  std::vector<TempWorld> small;
-  for (auto& parent : middle) {
-    auto split = split_parent(reference, parent.members,
-                              config.center_radii[2], config.beacon_ratios[2],
-                              config, stats.layers[2]);
-    parent.child_beacons = std::move(split.beacons);
-    for (auto& child : split.worlds) {
-      parent.children.push_back(small.size());
-      small.push_back(std::move(child));
-    }
-    std::vector<SequenceId>{}.swap(parent.members);
+    return children;
+  };
+  for (std::size_t layer = 1; layer < layer_count; ++layer) {
+    worlds[layer] = split_layer(worlds[layer - 1], layer);
   }
 
   NavigaMerIndex index;
@@ -307,27 +538,30 @@ NavigaMerIndex IndexBuilder::build(const SequenceStore& reference,
   index.stride = reference.stride();
   index.max_tolerance = config.max_tolerance;
   index.reference_window_count = reference.size();
-  index.layers[0] = {1, large.size(), config.center_radii[0]};
-  index.layers[1] = {1 + large.size(), middle.size(), config.center_radii[1]};
-  index.layers[2] = {1 + large.size() + middle.size(), small.size(),
-                     config.center_radii[2]};
-  index.nodes.resize(1 + large.size() + middle.size() + small.size());
-  index.center_sequences.resize(index.nodes.size());
+  index.reference_fingerprint = reference.fingerprint();
+  std::size_t node_count = 1;
+  for (std::size_t layer = 0; layer < layer_count; ++layer) {
+    index.layers.push_back({node_count, worlds[layer].size(), config.center_radii[layer]});
+    node_count += worlds[layer].size();
+  }
+  index.nodes.resize(node_count);
+  index.center_sequences = PackedCenters(reference.window_length());
+  // Node zero has no center, but retains a slot so center IDs equal node IDs.
+  index.center_sequences.append(std::string(reference.window_length(), 'A'));
   index.nodes[0].member_count = reference.size();
-  index.nodes[0].child_count = large.size();
-  for (std::size_t i = 0; i < large.size(); ++i) index.children.push_back(1 + i);
+  index.nodes[0].child_count = worlds[0].size();
+  for (std::size_t i = 0; i < worlds[0].size(); ++i) index.children.push_back(1 + i);
 
   auto copy_world = [&](const TempWorld& world, NodeId id, std::uint8_t layer) {
     auto& node = index.nodes[id];
     node.center_sequence_id = world.center;
     node.member_count = world.member_count;
     node.layer = layer;
-    index.center_sequences[id] = reference.sequence(world.center);
-    if (layer == 2) {
+    index.center_sequences.append(reference.sequence(world.center));
+    if (layer + 1u == layer_count) {
       node.first_member = index.leaf_ids.size();
       for (const auto member : world.members) {
         index.leaf_ids.push_back(member);
-        index.leaf_sequences.emplace_back(reference.sequence(member));
       }
     } else {
       node.first_child = index.children.size();
@@ -337,24 +571,19 @@ NavigaMerIndex IndexBuilder::build(const SequenceStore& reference,
       }
     }
   };
-  for (std::size_t i = 0; i < large.size(); ++i) {
-    copy_world(large[i], index.layers[0].first_node + i, 0);
-  }
-  for (std::size_t i = 0; i < middle.size(); ++i) {
-    copy_world(middle[i], index.layers[1].first_node + i, 1);
-  }
-  for (std::size_t i = 0; i < small.size(); ++i) {
-    copy_world(small[i], index.layers[2].first_node + i, 2);
+  for (std::size_t layer = 0; layer < layer_count; ++layer) {
+    for (std::size_t i = 0; i < worlds[layer].size(); ++i) {
+      copy_world(worlds[layer][i], index.layers[layer].first_node + i,
+                 static_cast<std::uint8_t>(layer));
+    }
   }
 
   persist_beacon_table(index, index.root, root_beacons);
-  for (std::size_t i = 0; i < large.size(); ++i) {
-    persist_beacon_table(index, index.layers[0].first_node + i,
-                         large[i].child_beacons);
-  }
-  for (std::size_t i = 0; i < middle.size(); ++i) {
-    persist_beacon_table(index, index.layers[1].first_node + i,
-                         middle[i].child_beacons);
+  for (std::size_t layer = 0; layer + 1 < layer_count; ++layer) {
+    for (std::size_t i = 0; i < worlds[layer].size(); ++i) {
+      persist_beacon_table(index, index.layers[layer].first_node + i,
+                           worlds[layer][i].child_beacons);
+    }
   }
   return index;
 }
