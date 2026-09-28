@@ -1,6 +1,7 @@
 #include "navigamer/builder.hpp"
 #include "navigamer/batch_distance.hpp"
 #include "navigamer/edit_distance.hpp"
+#include "navigamer/member_classifier.hpp"
 #include "navigamer/query.hpp"
 
 #include <algorithm>
@@ -61,6 +62,14 @@ void test_batch_distance() {
             assert(actual[lane] == dynamic_programming_distance(centers[group * batch.kLanes + lane], target));
           }
         }
+        for (std::size_t lanes = 1; lanes <= batch.kLanes; ++lanes) {
+          std::array<std::size_t, batch.kLanes> selected;
+          for (std::size_t lane = 0; lane < lanes; ++lane) selected[lane] = (count - 1 + 3 * lane) % count;
+          const auto actual = batch.exact_selected(target, std::span(selected.data(), lanes), workspace);
+          for (std::size_t lane = 0; lane < lanes; ++lane) {
+            assert(actual[lane] == dynamic_programming_distance(centers[selected[lane]], target));
+          }
+        }
       }
       const auto self = batch.exact_group(center, (count - 1) / batch.kLanes, workspace);
       assert(self[(count - 1) % batch.kLanes] == 0);
@@ -69,6 +78,12 @@ void test_batch_distance() {
     try { batch.append(std::string(length + 1, 'A')); }
     catch (const std::invalid_argument&) { rejected = true; }
     assert(rejected);
+    for (const auto& selected : {std::vector<std::size_t>{}, {0, 1, 2, 3, 4}, {13}}) {
+      rejected = false;
+      try { (void)batch.exact_selected("A", selected, workspace); }
+      catch (const std::exception&) { rejected = true; }
+      assert(rejected);
+    }
     rejected = false;
     try { (void)batch.exact_group("A", 4, workspace); }
     catch (const std::out_of_range&) { rejected = true; }
@@ -740,6 +755,217 @@ void test_genome_schedule() {
             << " false_negatives=0 false_positives=0\n";
 }
 
+void test_adjacent_classifier(const std::filesystem::path& directory) {
+  std::mt19937 random(27891);
+  std::uint64_t repeated = 0, avoided = 0;
+  for (const auto length : {8u, 65u, 150u}) {
+    std::string bases(length + 300, 'A'), other = bases;
+    for (auto& base : bases) base = "ACGTNRY"[random() % 7];
+    for (auto& base : other) base = "ACGTNRY"[random() % 7];
+    bases.replace(50, length + 40, length + 40, 'N');
+    std::ofstream out(directory / "adjacent-reference.fa");
+    // Duplicate contig names must not make bounds cross a contig boundary.
+    out << ">same\n" << bases << "\n>same\n" << other << '\n';
+    out.close();
+    for (const auto stride : {1u, 3u}) {
+      const auto reference = navigamer::SequenceStore::from_fasta(directory / "adjacent-reference.fa", length, stride);
+      std::vector<navigamer::SequenceId> centers{0, 8, 17, 25, 31, 40, 55, 67};
+      centers.push_back(reference.size() / 2);
+      centers.push_back(reference.size() - 1);
+      navigamer::BatchDistance profiles(length);
+      for (const auto id : centers) profiles.append(reference.sequence(id));
+      for (const auto tolerance : {0u, 1u, 5u, 100u}) {
+        navigamer::AdjacentClassifier classifier(reference, centers, profiles, tolerance);
+        std::vector<navigamer::SequenceId> ids;
+        for (navigamer::SequenceId id = 0; id < reference.size(); ++id) ids.push_back(id);
+        // Repeat the scan with gaps, large jumps and reversed positions.
+        for (navigamer::SequenceId id = 0; id < reference.size(); id += 7) ids.push_back(id);
+        for (auto id = reference.size(); id > 0; --id) ids.push_back(id - 1);
+        for (const auto id : ids) {
+          const auto actual = classifier.classify(id);
+          const auto center = std::find(centers.begin(), centers.end(), id);
+          std::vector<int> distances;
+          for (const auto c : centers) distances.push_back(distance(reference.sequence(id), reference.sequence(c)));
+          const auto minimum = *std::min_element(distances.begin(), distances.end());
+          for (std::size_t c = 0; c < centers.size(); ++c) {
+            const bool expected = center != centers.end() ? centers[c] == id
+                : distances[c] <= minimum + 2 * static_cast<int>(tolerance);
+            assert(bool(actual[c]) == expected);
+          }
+        }
+        repeated += classifier.repeated;
+        avoided += ids.size() * centers.size() - classifier.exact_pairs;
+      }
+      // End-to-end fast/old classification must serialize the same worlds.
+      navigamer::BuildConfig config;
+      config.max_tolerance = 1;
+      config.center_radii = {length / 2, length == 150 ? 60u : length / 3};
+      config.beacon_ratios = {0.1, 0.25};
+      const auto old = navigamer::IndexBuilder::build(reference, config);
+      old.save(directory / "classifier-beacon.nvm");
+      for (const auto threads : {1u, 4u}) {
+        config.classification_mode = navigamer::ClassificationMode::kAdjacent;
+        config.threads = threads;
+        const auto fast = navigamer::IndexBuilder::build(reference, config);
+        fast.save(directory / "classifier-adjacent.nvm");
+        assert(file_contents(directory / "classifier-beacon.nvm") == file_contents(directory / "classifier-adjacent.nvm"));
+      }
+      if (length == 150 && stride == 1) {
+        auto first_config = config;
+        first_config.center_radii = {75};
+        first_config.beacon_ratios = {0.1};
+        const auto first = navigamer::IndexBuilder::build(reference, first_config);
+        auto next_config = config;
+        next_config.center_radii = {60};
+        next_config.beacon_ratios = {0.25};
+        navigamer::IndexBuilder::extend(reference, first, next_config).save(directory / "r75-r60-staged.nvm");
+        assert(file_contents(directory / "r75-r60-staged.nvm") == file_contents(directory / "classifier-beacon.nvm"));
+      }
+    }
+  }
+  assert(repeated > 0 && avoided > 0);
+}
+
+void test_continued_build(const std::filesystem::path& directory) {
+  const auto reference = navigamer::SequenceStore::from_sequences({
+      "AAAAAAAA", "CCCCCAAA", "CCCCCCCC", "GGGGGGGG", "TTTTTTTT",
+      "NNNNNNNN", "CAAAAAAA", "CCAAAAAA", "AAAAAAAA"});
+  std::vector<navigamer::SequenceId> all(reference.size());
+  std::iota(all.begin(), all.end(), 0);
+  navigamer::BuildConfig prefix, suffix, complete;
+  prefix.max_tolerance = suffix.max_tolerance = complete.max_tolerance = 1;
+  prefix.center_radii = {6};
+  suffix.center_radii = {4, 3};
+  complete.center_radii = {6, 4, 3};
+  for (const bool cover : {false, true}) {
+    if (cover) {
+      prefix.beacon_cover_radii = std::vector<std::uint32_t>{3};
+      suffix.beacon_cover_radii = std::vector<std::uint32_t>{2, 1};
+      complete.beacon_cover_radii = std::vector<std::uint32_t>{3, 2, 1};
+    } else {
+      prefix.beacon_ratios = {0.5};
+      suffix.beacon_ratios = {0.0, 1.0};
+      complete.beacon_ratios = {0.5, 0.0, 1.0};
+    }
+    const auto first = navigamer::IndexBuilder::build(reference, prefix);
+    first.save(directory / "continue-input.nvm");
+    const auto initial_bytes = file_contents(directory / "continue-input.nvm");
+    const auto input = navigamer::NavigaMerIndex::load(directory / "continue-input.nvm");
+    const auto expected = navigamer::IndexBuilder::build(reference, complete);
+    expected.save(directory / "continue-expected.nvm");
+    for (const auto threads : {1u, 4u}) {
+      suffix.threads = threads;
+      suffix.classification_mode = threads == 4 ? navigamer::ClassificationMode::kAdjacent
+                                               : navigamer::ClassificationMode::kBeacon;
+      navigamer::BuildStats stats;
+      auto extended = navigamer::IndexBuilder::extend(reference, input, suffix, &stats);
+      assert(stats.layers.size() == 2);
+      assert(!extended.is_scoped() && extended.layers.size() == 3);
+      extended.save(directory / "continued.nvm");
+      assert(file_contents(directory / "continued.nvm") == file_contents(directory / "continue-expected.nvm"));
+      if (!cover) check_hierarchy(extended, reference, complete, extended.root, all, 0);
+      navigamer::QueryEngine engine(extended, reference);
+      check_batch(engine, reference, {"AAAAAAAA", "CCCCCAAA", "GGGGGGGG", "NNNNNNNN"}, {1});
+    }
+    // A second continuation must also preserve BFS order and existing tables.
+    auto one = suffix;
+    one.center_radii = {4};
+    one.beacon_ratios = cover ? std::vector<double>{} : std::vector<double>{0.0};
+    if (cover) one.beacon_cover_radii = std::vector<std::uint32_t>{2};
+    auto two = navigamer::IndexBuilder::extend(reference, input, one);
+    one.center_radii = {3};
+    one.beacon_ratios = cover ? std::vector<double>{} : std::vector<double>{1.0};
+    if (cover) one.beacon_cover_radii = std::vector<std::uint32_t>{1};
+    navigamer::IndexBuilder::extend(reference, two, one).save(directory / "continued-twice.nvm");
+    assert(file_contents(directory / "continued-twice.nvm") == file_contents(directory / "continue-expected.nvm"));
+    assert(file_contents(directory / "continue-input.nvm") == initial_bytes);
+  }
+
+  // Rebuild an internal world that already has descendants. The old descendants
+  // must not be appended or copied, and the root center need not be the first ID.
+  complete.beacon_cover_radii.reset();
+  complete.beacon_ratios.clear();
+  const auto input = navigamer::IndexBuilder::build(reference, complete);
+  const auto world = input.children[input.nodes[input.root].first_child + 1];
+  const auto members = input.world_members(world);
+  assert(members.front() != input.nodes[world].center_sequence_id);
+  assert(members.size() < reference.size());
+  navigamer::BuildConfig replacement;
+  replacement.max_tolerance = 1;
+  replacement.center_radii = {5, 3};
+  replacement.threads = 3;
+  replacement.classification_mode = navigamer::ClassificationMode::kAdjacent;
+  const auto rebuilt = navigamer::IndexBuilder::rebuild_world(reference, input, world, replacement);
+  assert(rebuilt.layers.size() == 2 && rebuilt.layers[0].selection_radius == 5);
+  assert(rebuilt.is_scoped());
+  assert(rebuilt.nodes[rebuilt.root].center_sequence_id == input.nodes[world].center_sequence_id);
+  assert(rebuilt.center_sequences.decode(rebuilt.root) == reference.sequence(input.nodes[world].center_sequence_id));
+  assert(rebuilt.world_members(rebuilt.root) == members);
+  check_hierarchy(rebuilt, reference, replacement, rebuilt.root, members, 0);
+  rebuilt.save(directory / "subworld.nvm");
+  const auto loaded = navigamer::NavigaMerIndex::load(directory / "subworld.nvm");
+  assert(loaded.is_scoped() && loaded.world_members(loaded.root) == members);
+  assert(loaded.reference_window_count == reference.size());
+  navigamer::QueryEngine engine(loaded, reference);
+  std::vector<std::string> queries;
+  for (const auto id : all) queries.emplace_back(reference.sequence(id));
+  queries.insert(queries.end(), {"CCCCCAA", "CCCCCCCCC", ""});
+  for (const auto mode : {navigamer::RouteMode::kScan, navigamer::RouteMode::kMultilateration}) {
+    navigamer::PathCache cache;
+    for (const auto& query : queries) {
+      auto expected = oracle(reference, query, 1, true);
+      std::erase_if(expected, [&](const auto& hit) {
+        return !std::binary_search(members.begin(), members.end(), hit.occurrence_id);
+      });
+      check_hits(expected, engine.query(query, {1, mode, true, true}, &cache));
+      auto brute = navigamer::brute_force_query(loaded, reference, query, 1);
+      auto forward = oracle(reference, query, 1, false);
+      std::erase_if(forward, [&](const auto& hit) {
+        return !std::binary_search(members.begin(), members.end(), hit.occurrence_id);
+      });
+      check_hits(forward, brute);
+    }
+  }
+  const auto leaf = input.layers.back().first_node;
+  auto leaf_rebuilt = navigamer::IndexBuilder::rebuild_world(reference, input, leaf, replacement);
+  assert(leaf_rebuilt.world_members(leaf_rebuilt.root) == input.world_members(leaf));
+  replacement.center_radii = {3};
+  auto appended = navigamer::IndexBuilder::extend(reference, loaded, replacement);
+  assert(appended.is_scoped() && appended.layers.size() == 3);
+  assert(appended.world_members(appended.root) == members);
+  assert(appended.nodes[appended.root].center_sequence_id == loaded.nodes[loaded.root].center_sequence_id);
+  auto root_rebuilt = navigamer::IndexBuilder::rebuild_world(reference, input, input.root, replacement);
+  assert(!root_rebuilt.is_scoped() && root_rebuilt.world_members(root_rebuilt.root) == all);
+
+  auto expect_rejected = [&](auto operation) {
+    bool rejected = false;
+    try { operation(); } catch (const std::exception&) { rejected = true; }
+    assert(rejected);
+  };
+  expect_rejected([&] { navigamer::IndexBuilder::rebuild_world(reference, input, input.nodes.size(), replacement); });
+  auto bad = replacement;
+  bad.max_tolerance = 2;
+  expect_rejected([&] { navigamer::IndexBuilder::extend(reference, input, bad); });
+  bad = replacement;
+  bad.threads = 0;
+  expect_rejected([&] { navigamer::IndexBuilder::extend(reference, input, bad); });
+  bad = replacement;
+  bad.center_radii.assign(253, 3);
+  expect_rejected([&] { navigamer::IndexBuilder::extend(reference, input, bad); });
+  bad = replacement;
+  bad.center_radii.clear();
+  expect_rejected([&] { navigamer::IndexBuilder::extend(reference, input, bad); });
+  bad = replacement;
+  bad.beacon_ratios = {0.1, 0.2};
+  expect_rejected([&] { navigamer::IndexBuilder::extend(reference, input, bad); });
+  auto legacy = input;
+  legacy.uses_shared_reference = false;
+  expect_rejected([&] { navigamer::IndexBuilder::extend(reference, legacy, replacement); });
+  auto mismatch = input;
+  ++mismatch.reference_fingerprint;
+  expect_rejected([&] { navigamer::IndexBuilder::extend(reference, mismatch, replacement); });
+}
+
 void test_variable_layers(const std::filesystem::path& directory) {
   const auto reference = navigamer::SequenceStore::from_sequences({
       "AAAAAAAA", "CCCCCCCC", "GGGGGGGG", "TTTTTTTT", "NNNNNNNN",
@@ -954,6 +1180,8 @@ int main(int argc, char** argv) {
   test_files(directory);
   test_genome_schedule();
   test_variable_layers(directory);
+  test_continued_build(directory);
+  test_adjacent_classifier(directory);
   test_center_selection_reuse(directory);
   test_batch_center_selection(directory);
   std::cout << "all tests passed\n";

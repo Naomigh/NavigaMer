@@ -51,6 +51,83 @@ foreach(block_size 1 3)
     message(FATAL_ERROR "Each world must be visited once regardless of worker threshold: ${LAST_CLI_OUTPUT}")
   endif()
 endforeach()
+
+# Continuation preserves the input and produces the canonical one-shot bytes.
+file(REMOVE "${TEST_DIR}/extended.nvm" "${TEST_DIR}/extended-again.nvm"
+  "${TEST_DIR}/rebuilt.nvm")
+run_cli(build --reference "${TEST_DIR}/reference.fa" --index "${TEST_DIR}/prefix.nvm"
+  --window 4 --T 1 --radii 4 --beacon-ratios 0.5 --threads 1)
+file(SHA256 "${TEST_DIR}/prefix.nvm" input_hash)
+run_cli(extend --reference "${TEST_DIR}/reference.fa" --input "${TEST_DIR}/prefix.nvm"
+  --index "${TEST_DIR}/extended.nvm" --radii 3,3 --beacon-ratios 0,1 --threads 2 --classifier adjacent)
+run_cli(build --reference "${TEST_DIR}/reference.fa" --index "${TEST_DIR}/oneshot.nvm"
+  --window 4 --T 1 --radii 4,3,3 --beacon-ratios 0.5,0,1 --threads 1)
+file(SHA256 "${TEST_DIR}/oneshot.nvm" oneshot_hash)
+file(SHA256 "${TEST_DIR}/extended.nvm" extended_hash)
+file(SHA256 "${TEST_DIR}/prefix.nvm" after_hash)
+if(NOT oneshot_hash STREQUAL extended_hash OR NOT input_hash STREQUAL after_hash)
+  message(FATAL_ERROR "Continuation differs from one-shot build or changed its input")
+endif()
+run_cli(verify --reference "${TEST_DIR}/reference.fa" --index "${TEST_DIR}/extended.nvm"
+  --queries "${TEST_DIR}/queries.fa" --both-strands)
+run_cli(extend --reference "${TEST_DIR}/reference.fa" --input "${TEST_DIR}/extended.nvm"
+  --index "${TEST_DIR}/extended-again.nvm" --radii 3 --threads 2)
+
+# Rebuilding an internal world ignores its old descendants and limits query scope.
+file(WRITE "${TEST_DIR}/scopes.fa" ">a\nAAAAAA\n>c\nCCCCCC\n>g\nGGGGGG\n")
+file(WRITE "${TEST_DIR}/scope-queries.fa" ">a\nAAAA\n>c\nCCCC\n>g\nGGGG\n")
+run_cli(build --reference "${TEST_DIR}/scopes.fa" --index "${TEST_DIR}/scopes.nvm"
+  --window 4 --T 1 --radii 3,3,3 --threads 2)
+run_cli(inspect --index "${TEST_DIR}/scopes.nvm" --worlds)
+if(NOT LAST_CLI_OUTPUT MATCHES "node_id\tparent_id\tlayer\tcenter_sequence_id\tmembers\tchildren" OR
+   NOT LAST_CLI_OUTPUT MATCHES "\n1\t0\t0\t0\t3\t1\n")
+  message(FATAL_ERROR "World inspection did not expose selectable node IDs")
+endif()
+file(SHA256 "${TEST_DIR}/scopes.nvm" scope_hash)
+run_cli(rebuild-world --reference "${TEST_DIR}/scopes.fa" --input "${TEST_DIR}/scopes.nvm"
+  --world 1 --index "${TEST_DIR}/rebuilt.nvm" --radii 3 --threads 2 --classifier adjacent)
+if(NOT LAST_CLI_OUTPUT MATCHES "scope=world scope_members=3 root_center_sequence_id=0" OR
+   NOT LAST_CLI_OUTPUT MATCHES "layers=1 ")
+  message(FATAL_ERROR "Rebuilt world did not retain its own scope/center or replace descendants")
+endif()
+run_cli(verify --reference "${TEST_DIR}/scopes.fa" --index "${TEST_DIR}/rebuilt.nvm"
+  --queries "${TEST_DIR}/scope-queries.fa" --both-strands)
+run_cli(query --reference "${TEST_DIR}/scopes.fa" --index "${TEST_DIR}/rebuilt.nvm"
+  --queries "${TEST_DIR}/scope-queries.fa" --output "${TEST_DIR}/scoped.tsv")
+file(READ "${TEST_DIR}/scoped.tsv" scoped_hits)
+if(scoped_hits MATCHES "\nc\t" OR scoped_hits MATCHES "\ng\t")
+  message(FATAL_ERROR "Rebuilt world returned external members")
+endif()
+file(SHA256 "${TEST_DIR}/scopes.nvm" scope_after_hash)
+if(NOT scope_hash STREQUAL scope_after_hash)
+  message(FATAL_ERROR "Rebuild modified its input")
+endif()
+foreach(invalid_options "--radii;3;--T;2" "--radii;3;--world;1"
+    "--radii;3;--window;4" "--radii;3;--stride;1" "--radii;3;--limit;2" "--threads;2"
+    "--radii;3;--classifier;unknown")
+  execute_process(COMMAND "${NAVIGAMER}" extend --reference "${TEST_DIR}/reference.fa"
+    --input "${TEST_DIR}/prefix.nvm" --index "${TEST_DIR}/invalid-continue.nvm" ${invalid_options}
+    RESULT_VARIABLE invalid_result OUTPUT_QUIET ERROR_VARIABLE invalid_error)
+  if(invalid_result EQUAL 0 OR NOT invalid_error MATCHES "error:")
+    message(FATAL_ERROR "Invalid continuation accepted: ${invalid_options}")
+  endif()
+endforeach()
+foreach(output_path "${TEST_DIR}/prefix.nvm" "${TEST_DIR}/extended.nvm")
+  execute_process(COMMAND "${NAVIGAMER}" extend --reference "${TEST_DIR}/reference.fa"
+    --input "${TEST_DIR}/prefix.nvm" --index "${output_path}" --radii 3
+    RESULT_VARIABLE invalid_result OUTPUT_QUIET ERROR_VARIABLE invalid_error)
+  if(invalid_result EQUAL 0 OR NOT invalid_error MATCHES "already exists")
+    message(FATAL_ERROR "Continuation overwrite was not rejected")
+  endif()
+endforeach()
+foreach(world "99999" "-1" "1,2" "1x")
+  execute_process(COMMAND "${NAVIGAMER}" rebuild-world --reference "${TEST_DIR}/scopes.fa"
+    --input "${TEST_DIR}/scopes.nvm" --index "${TEST_DIR}/invalid-world.nvm" --world "${world}" --radii 3
+    RESULT_VARIABLE invalid_result OUTPUT_QUIET ERROR_VARIABLE invalid_error)
+  if(invalid_result EQUAL 0 OR NOT invalid_error MATCHES "error:")
+    message(FATAL_ERROR "Invalid world was not rejected: ${world}")
+  endif()
+endforeach()
 file(READ "${TEST_DIR}/batch-1.tsv" single_batch_hits)
 file(READ "${TEST_DIR}/batch-3.tsv" grouped_batch_hits)
 if(NOT single_batch_hits STREQUAL grouped_batch_hits)

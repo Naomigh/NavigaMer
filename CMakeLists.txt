@@ -36,6 +36,7 @@ add_library(navigamer_core
   src/packed_centers.cpp
   src/edit_distance.cpp
   src/batch_distance.cpp
+  src/member_classifier.cpp
   src/index.cpp
   src/builder.cpp
   src/query.cpp

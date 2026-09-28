@@ -72,7 +72,7 @@ std::array<int, BatchDistance::kLanes> BatchDistance::exact_group(
     return result;
   }
 #ifdef NAVIGAMER_BATCH_AVX2
-  if (simd_available()) return avx2_group(target, group, workspace);
+  if (simd_available()) return avx2_profile(target, groups_[group].symbols, groups_[group].masks, workspace);
 #else
   (void)workspace;
 #endif
@@ -82,11 +82,61 @@ std::array<int, BatchDistance::kLanes> BatchDistance::exact_group(
   return result;
 }
 
+std::array<int, BatchDistance::kLanes> BatchDistance::exact_selected(
+    std::string_view target, std::span<const std::size_t> selected, Workspace& workspace) const {
+  if (selected.empty() || selected.size() > kLanes) {
+    throw std::invalid_argument("selected batch must contain 1..kLanes centers");
+  }
+  for (const auto id : selected) {
+    if (id >= size()) throw std::out_of_range("selected center out of range");
+  }
+  if (target.size() > static_cast<std::size_t>(std::numeric_limits<int>::max() - 64)) {
+    throw std::length_error("target too long for batch distance");
+  }
+#ifdef NAVIGAMER_BATCH_AVX2
+  if (simd_available() && length_ != 0 && selected.size() > 1) {
+    workspace.gathered_symbols.fill(256);
+    std::size_t alphabet_size = 0;
+    for (std::size_t symbol = 0; symbol < 256; ++symbol) {
+      for (const auto id : selected) {
+        if (groups_[id / kLanes].symbols[symbol] != 256) {
+          workspace.gathered_symbols[symbol] = alphabet_size++;
+          break;
+        }
+      }
+    }
+    workspace.gathered_masks.resize(alphabet_size * block_count_ * kLanes);
+    for (std::size_t symbol = 0; symbol < 256; ++symbol) {
+      const auto destination = workspace.gathered_symbols[symbol];
+      if (destination == 256) continue;
+      for (std::size_t b = 0; b < block_count_; ++b) {
+        for (std::size_t lane = 0; lane < kLanes; ++lane) {
+          const auto id = selected[std::min(lane, selected.size() - 1)];
+          const auto& source = groups_[id / kLanes];
+          const auto slot = source.symbols[symbol];
+          workspace.gathered_masks[(destination * block_count_ + b) * kLanes + lane] = slot == 256
+              ? (b + 1 == block_count_ ? padding_mask_ : 0)
+              : source.masks[(slot * block_count_ + b) * kLanes + id % kLanes];
+        }
+      }
+    }
+    return avx2_profile(target, workspace.gathered_symbols, workspace.gathered_masks, workspace);
+  }
+#else
+  (void)workspace;
+#endif
+  std::array<int, kLanes> result{};
+  for (std::size_t lane = 0; lane < selected.size(); ++lane) {
+    result[lane] = EditDistance::exact(centers_[selected[lane]], target);
+  }
+  return result;
+}
+
 #ifdef NAVIGAMER_BATCH_AVX2
 __attribute__((target("avx2")))
-std::array<int, BatchDistance::kLanes> BatchDistance::avx2_group(
-    std::string_view target, std::size_t group_id, Workspace& workspace) const {
-  const auto& group = groups_[group_id];
+std::array<int, BatchDistance::kLanes> BatchDistance::avx2_profile(
+    std::string_view target, const std::array<std::uint16_t, 256>& symbols,
+    const std::vector<std::uint64_t>& masks, Workspace& workspace) const {
   workspace.blocks.resize(block_count_);
   const auto ones = _mm256_set1_epi64x(-1);
   const auto one = _mm256_set1_epi64x(1);
@@ -97,7 +147,7 @@ std::array<int, BatchDistance::kLanes> BatchDistance::avx2_group(
   auto score = _mm256_set1_epi64x(static_cast<long long>(block_count_ * 64));
   for (const unsigned char symbol : target) {
     auto carry = one;
-    const auto slot = group.symbols[symbol];
+    const auto slot = symbols[symbol];
     for (std::size_t b = 0; b < block_count_; ++b) {
       auto& block = workspace.blocks[b];
       const auto positive = _mm256_load_si256(reinterpret_cast<const __m256i*>(block.positive.data()));
@@ -105,7 +155,7 @@ std::array<int, BatchDistance::kLanes> BatchDistance::avx2_group(
       const auto equal = slot == 256
           ? _mm256_set1_epi64x(b + 1 == block_count_ ? static_cast<long long>(padding_mask_) : 0)
           : _mm256_loadu_si256(reinterpret_cast<const __m256i*>(
-                group.masks.data() + (slot * block_count_ + b) * kLanes));
+                masks.data() + (slot * block_count_ + b) * kLanes));
       // carry is -1, 0 or 1. Logical shift suffices to extract its sign bit.
       const auto carry_negative = _mm256_and_si256(_mm256_srli_epi64(carry, 2), one);
       const auto vertical = _mm256_or_si256(equal, negative);

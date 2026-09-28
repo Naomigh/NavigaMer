@@ -3,6 +3,7 @@
 #include <array>
 #include <algorithm>
 #include <fstream>
+#include <queue>
 #include <sstream>
 #include <stdexcept>
 
@@ -182,6 +183,44 @@ std::uint64_t NavigaMerIndex::bytes() const noexcept {
   return result;
 }
 
+std::vector<SequenceId> NavigaMerIndex::world_members(NodeId world) const {
+  if (world >= nodes.size()) throw std::out_of_range("world node ID out of range");
+  std::vector<NodeId> pending{world};
+  struct Cursor { std::span<const SequenceId> ids; std::size_t position; };
+  auto later = [](const Cursor& lhs, const Cursor& rhs) {
+    return lhs.ids[lhs.position] > rhs.ids[rhs.position];
+  };
+  std::priority_queue<Cursor, std::vector<Cursor>, decltype(later)> leaves(later);
+  std::vector<SequenceId> result;
+  result.reserve(nodes[world].member_count);
+  while (!pending.empty()) {
+    const auto id = pending.back();
+    pending.pop_back();
+    if (is_leaf(id)) {
+      const auto values = members(id);
+      if (!values.empty()) leaves.push({values, 0});
+    } else {
+      const auto& node = nodes[id];
+      for (std::uint64_t c = 0; c < node.child_count; ++c) {
+        pending.push_back(children[node.first_child + c]);
+      }
+    }
+  }
+  // Leaves are in occurrence-ID order. Merge them without first materializing
+  // every overlapping relationship, which could dwarf the parent member set.
+  while (!leaves.empty()) {
+    auto cursor = leaves.top();
+    leaves.pop();
+    const auto id = cursor.ids[cursor.position];
+    if (result.empty() || result.back() != id) result.push_back(id);
+    if (++cursor.position < cursor.ids.size()) leaves.push(cursor);
+  }
+  if (result.size() != nodes[world].member_count) {
+    throw std::runtime_error("world member count differs from its descendant union");
+  }
+  return result;
+}
+
 std::string NavigaMerIndex::summary() const {
   std::ostringstream out;
   out << "format_version=" << (uses_shared_reference ? kIndexFormatVersion : 4)
@@ -191,6 +230,10 @@ std::string NavigaMerIndex::summary() const {
       << " leaf_memberships=" << leaf_ids.size() << '\n';
   out << "member_storage=" << (uses_shared_reference ? "reference-ids" : "legacy-owned-sequences")
       << " reference_fingerprint=" << reference_fingerprint << '\n';
+  out << "scope=" << (is_scoped() ? "world" : "reference")
+      << " scope_members=" << nodes[root].member_count;
+  if (is_scoped()) out << " root_center_sequence_id=" << nodes[root].center_sequence_id;
+  out << '\n';
   for (std::size_t layer = 0; layer < layers.size(); ++layer) {
     out << "layer=" << layer << " radius=" << layers[layer].selection_radius
         << " worlds=" << layers[layer].node_count << '\n';

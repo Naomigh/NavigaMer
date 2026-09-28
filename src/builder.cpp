@@ -2,6 +2,7 @@
 
 #include "navigamer/batch_distance.hpp"
 #include "navigamer/edit_distance.hpp"
+#include "navigamer/member_classifier.hpp"
 #include "navigamer/prefetch.hpp"
 
 #include <algorithm>
@@ -9,6 +10,7 @@
 #include <barrier>
 #include <chrono>
 #include <cmath>
+#include <exception>
 #include <limits>
 #include <numeric>
 #include <stdexcept>
@@ -53,12 +55,18 @@ void parallel_workers(std::size_t count, std::uint32_t requested,
   const auto worker_count = active_workers(count, requested);
   if (worker_count == 0) return;
   std::vector<std::thread> workers;
+  std::vector<std::exception_ptr> errors(worker_count);
+  auto run = [&](std::size_t worker) {
+    try { function(worker, worker_count); }
+    catch (...) { errors[worker] = std::current_exception(); }
+  };
   workers.reserve(worker_count - 1);
   for (std::size_t worker = 1; worker < worker_count; ++worker) {
-    workers.emplace_back(function, worker, worker_count);
+    workers.emplace_back(run, worker);
   }
-  function(0, worker_count);
+  run(0);
   for (auto& worker : workers) worker.join();
+  for (const auto& error : errors) if (error) std::rethrow_exception(error);
 }
 
 CenterSelection choose_centers(const SequenceStore& reference,
@@ -263,6 +271,7 @@ struct WorkerClassificationStats {
   std::uint64_t center_pairs{0};
   std::uint64_t pruned_pairs{0};
   std::uint64_t members{0};
+  std::uint64_t repeated{0};
 };
 
 std::vector<std::vector<SequenceId>> classify_members(
@@ -271,13 +280,16 @@ std::vector<std::vector<SequenceId>> classify_members(
     const BuildConfig& config, LayerBuildStats& stats) {
   const bool use_batch = BatchDistance::simd_available();
   BatchDistance batch(reference.window_length());
-  if (use_batch) {
+  if (use_batch || config.classification_mode == ClassificationMode::kAdjacent) {
     for (const auto id : centers.ids) batch.append(reference.sequence(id));
   }
   const auto no_center = std::numeric_limits<std::size_t>::max();
-  std::vector<std::size_t> exclusive_world(members.size(), no_center);
-  for (std::size_t c = 0; c < centers.ids.size(); ++c) {
-    exclusive_world[centers.member_ordinals[c]] = c;
+  std::vector<std::size_t> exclusive_world;
+  if (config.classification_mode == ClassificationMode::kBeacon) {
+    exclusive_world.assign(members.size(), no_center);
+    for (std::size_t c = 0; c < centers.ids.size(); ++c) {
+      exclusive_world[centers.member_ordinals[c]] = c;
+    }
   }
 
   const auto worker_count = active_workers(members.size(), config.threads);
@@ -295,6 +307,26 @@ std::vector<std::vector<SequenceId>> classify_members(
     const auto begin = members.size() * worker / workers;
     const auto end = members.size() * (worker + 1) / workers;
     const auto nc = centers.ids.size(), nb = table.ordinals.size();
+    if (config.classification_mode == ClassificationMode::kAdjacent) {
+      AdjacentClassifier classifier(reference, centers.ids, batch, config.max_tolerance);
+      for (auto i = begin; i < end; ++i) {
+        const auto before = classifier.exact_pairs;
+        const auto exclusive_before = classifier.exclusive_members;
+        const auto assignment = classifier.classify(members[i]);
+        for (std::size_t c = 0; c < nc; ++c) {
+          if (assignment[c]) buckets[c].push_back(members[i]);
+        }
+        if (classifier.exclusive_members == exclusive_before) {
+          ++local.members;
+          local.center_pairs += nc;
+          local.pruned_pairs += nc - (classifier.exact_pairs - before);
+        }
+      }
+      local.candidate_edit_calls = classifier.exact_pairs;
+      local.candidate_batch_groups = classifier.batch_groups;
+      local.repeated = classifier.repeated;
+      return;
+    }
     constexpr std::size_t query_tile = 8, center_tile = 32;
     std::array<std::string_view, query_tile> sequences;
     std::vector<int> distances(query_tile * nc), anchors(query_tile * nb);
@@ -389,6 +421,7 @@ std::vector<std::vector<SequenceId>> classify_members(
     stats.classification_center_pairs += local.center_pairs;
     stats.pruned_center_pairs += local.pruned_pairs;
     stats.classified_members += local.members;
+    stats.classification_repeated += local.repeated;
   }
   std::vector<std::vector<SequenceId>> buckets(centers.ids.size());
   for (std::size_t c = 0; c < centers.ids.size(); ++c) {
@@ -447,11 +480,7 @@ void persist_beacon_table(NavigaMerIndex& index, NodeId parent_id,
                                 table.distances.begin(), table.distances.end());
 }
 
-}  // namespace
-
-NavigaMerIndex IndexBuilder::build(const SequenceStore& reference,
-                                   const BuildConfig& config,
-                                   BuildStats* build_stats) {
+void validate_build_config(const SequenceStore& reference, const BuildConfig& config) {
   if (reference.size() == 0) {
     throw std::invalid_argument("cannot build an index from an empty reference");
   }
@@ -473,14 +502,21 @@ NavigaMerIndex IndexBuilder::build(const SequenceStore& reference,
       throw std::invalid_argument("beacon ratios must be between 0 and 1");
     }
   }
+}
+
+NavigaMerIndex build_scope(const SequenceStore& reference,
+                           const std::vector<SequenceId>& members,
+                           SequenceId root_center, const BuildConfig& config,
+                           BuildStats* build_stats) {
+  validate_build_config(reference, config);
+  const auto layer_count = config.center_radii.size();
   BuildStats local_stats;
   BuildStats& stats = build_stats ? *build_stats : local_stats;
   stats = {};
   stats.layers.resize(layer_count);
 
-  std::vector<SequenceId> all(reference.size());
-  std::iota(all.begin(), all.end(), 0);
-  auto large_split = split_parent(reference, all, 0, config, stats.layers[0]);
+  if (members.empty()) throw std::invalid_argument("cannot build an empty world");
+  auto large_split = split_parent(reference, members, 0, config, stats.layers[0]);
   auto root_beacons = std::move(large_split.beacons);
   std::vector<std::vector<TempWorld>> worlds(layer_count);
   worlds[0] = std::move(large_split.worlds);
@@ -526,6 +562,7 @@ NavigaMerIndex IndexBuilder::build(const SequenceStore& reference,
       total.classification_center_pairs += s.classification_center_pairs;
       total.pruned_center_pairs += s.pruned_center_pairs;
       total.classified_members += s.classified_members;
+      total.classification_repeated += s.classification_repeated;
     }
     return children;
   };
@@ -546,9 +583,12 @@ NavigaMerIndex IndexBuilder::build(const SequenceStore& reference,
   }
   index.nodes.resize(node_count);
   index.center_sequences = PackedCenters(reference.window_length());
-  // Node zero has no center, but retains a slot so center IDs equal node IDs.
-  index.center_sequences.append(std::string(reference.window_length(), 'A'));
-  index.nodes[0].member_count = reference.size();
+  // Retain a root slot so packed center IDs equal node IDs. Scoped roots keep
+  // the selected world's center; it does not seed greedy child selection.
+  index.center_sequences.append(root_center == kNoSequence
+      ? std::string(reference.window_length(), 'A') : std::string(reference.sequence(root_center)));
+  index.nodes[0].center_sequence_id = root_center;
+  index.nodes[0].member_count = members.size();
   index.nodes[0].child_count = worlds[0].size();
   for (std::size_t i = 0; i < worlds[0].size(); ++i) index.children.push_back(1 + i);
 
@@ -586,6 +626,163 @@ NavigaMerIndex IndexBuilder::build(const SequenceStore& reference,
     }
   }
   return index;
+}
+
+void validate_input(const SequenceStore& reference, const NavigaMerIndex& input,
+                    const BuildConfig& config) {
+  if (!input.uses_shared_reference) {
+    throw std::invalid_argument("continuation requires a reference-backed v5 index");
+  }
+  if (reference.size() != input.reference_window_count ||
+      reference.fingerprint() != input.reference_fingerprint ||
+      reference.window_length() != input.window_length || reference.stride() != input.stride) {
+    throw std::invalid_argument("reference does not match the input index");
+  }
+  if (config.max_tolerance != input.max_tolerance) {
+    throw std::invalid_argument("continuation must retain the input build tolerance");
+  }
+  if (input.layers.empty() || input.root >= input.nodes.size()) {
+    throw std::invalid_argument("input index has no world hierarchy");
+  }
+}
+
+void accumulate_stats(LayerBuildStats& total, const LayerBuildStats& value) {
+  total.center_selection_seconds += value.center_selection_seconds;
+  total.beacon_table_seconds += value.beacon_table_seconds;
+  total.classification_seconds += value.classification_seconds;
+  total.center_edit_calls += value.center_edit_calls;
+  total.center_bound_accepts += value.center_bound_accepts;
+  total.center_hint_hits += value.center_hint_hits;
+  total.center_batch_groups += value.center_batch_groups;
+  total.beacon_selection_edit_calls += value.beacon_selection_edit_calls;
+  total.selected_beacons += value.selected_beacons;
+  total.beacon_table_edit_calls += value.beacon_table_edit_calls;
+  total.member_beacon_edit_calls += value.member_beacon_edit_calls;
+  total.candidate_edit_calls += value.candidate_edit_calls;
+  total.candidate_batch_groups += value.candidate_batch_groups;
+  total.classification_center_pairs += value.classification_center_pairs;
+  total.pruned_center_pairs += value.pruned_center_pairs;
+  total.classified_members += value.classified_members;
+  total.classification_repeated += value.classification_repeated;
+}
+
+}  // namespace
+
+NavigaMerIndex IndexBuilder::build(const SequenceStore& reference,
+                                   const BuildConfig& config, BuildStats* stats) {
+  validate_build_config(reference, config);
+  std::vector<SequenceId> members(reference.size());
+  std::iota(members.begin(), members.end(), 0);
+  return build_scope(reference, members, kNoSequence, config, stats);
+}
+
+NavigaMerIndex IndexBuilder::rebuild_world(const SequenceStore& reference,
+                                           const NavigaMerIndex& input, NodeId world,
+                                           const BuildConfig& config, BuildStats* stats) {
+  validate_input(reference, input, config);
+  validate_build_config(reference, config);
+  const auto members = input.world_members(world);
+  return build_scope(reference, members, input.nodes[world].center_sequence_id, config, stats);
+}
+
+NavigaMerIndex IndexBuilder::extend(const SequenceStore& reference,
+                                    const NavigaMerIndex& input,
+                                    const BuildConfig& config, BuildStats* build_stats) {
+  validate_input(reference, input, config);
+  validate_build_config(reference, config);
+  if (config.center_radii.empty() || input.layers.size() + config.center_radii.size() > kRootLayer) {
+    throw std::invalid_argument("extended layer count must be between 1 and 255");
+  }
+  const auto& leaves = input.layers.back();
+  if (leaves.node_count == 0) throw std::invalid_argument("input index has no leaf worlds");
+  std::vector<NavigaMerIndex> subtrees(leaves.node_count);
+  std::vector<BuildStats> parent_stats(leaves.node_count);
+  auto inner_config = config;
+  inner_config.threads = config.threads / active_workers(leaves.node_count, config.threads);
+  std::atomic<std::size_t> next{0};
+  parallel_workers(leaves.node_count, config.threads, [&](std::size_t, std::size_t) {
+    for (;;) {
+      const auto parent = next.fetch_add(1, std::memory_order_relaxed);
+      if (parent >= leaves.node_count) break;
+      subtrees[parent] = rebuild_world(reference, input, leaves.first_node + parent,
+                                       inner_config, &parent_stats[parent]);
+    }
+  });
+  BuildStats local_stats;
+  auto& stats = build_stats ? *build_stats : local_stats;
+  stats = {};
+  stats.layers.resize(config.center_radii.size());
+  for (const auto& value : parent_stats) {
+    for (std::size_t layer = 0; layer < stats.layers.size(); ++layer) {
+      accumulate_stats(stats.layers[layer], value.layers[layer]);
+    }
+  }
+
+  NavigaMerIndex result;
+  result.window_length = input.window_length;
+  result.stride = input.stride;
+  result.max_tolerance = input.max_tolerance;
+  result.reference_window_count = input.reference_window_count;
+  result.reference_fingerprint = input.reference_fingerprint;
+  result.root = input.root;
+  result.layers = input.layers;
+  result.nodes = input.nodes;
+  result.center_sequences = input.center_sequences;
+  result.children = input.children;
+  result.beacon_ordinals = input.beacon_ordinals;
+  result.beacon_distances = input.beacon_distances;
+  // Canonical BFS node/storage order makes staged and one-shot builds identical.
+  std::vector<std::vector<NodeId>> mapping(subtrees.size());
+  for (std::size_t p = 0; p < subtrees.size(); ++p) {
+    mapping[p].resize(subtrees[p].nodes.size());
+    mapping[p][0] = leaves.first_node + p;
+    result.nodes[leaves.first_node + p].first_member = 0;
+  }
+  for (std::size_t layer = 0; layer < config.center_radii.size(); ++layer) {
+    const auto first = result.nodes.size();
+    for (std::size_t p = 0; p < subtrees.size(); ++p) {
+      const auto& sub = subtrees[p];
+      const auto& info = sub.layers[layer];
+      for (NodeId id = info.first_node; id < info.first_node + info.node_count; ++id) {
+        mapping[p][id] = result.nodes.size();
+        auto node = sub.nodes[id];
+        node.layer = input.layers.size() + layer;
+        result.nodes.push_back(node);
+        result.center_sequences.append(reference.sequence(node.center_sequence_id));
+      }
+    }
+    result.layers.push_back({first, result.nodes.size() - first, config.center_radii[layer]});
+  }
+  auto copy_parent = [&](std::size_t p, NodeId id) {
+    const auto& sub = subtrees[p];
+    const auto& source = sub.nodes[id];
+    auto& target = result.nodes[mapping[p][id]];
+    if (sub.is_leaf(id)) {
+      target.first_member = result.leaf_ids.size();
+      const auto members = sub.members(id);
+      result.leaf_ids.insert(result.leaf_ids.end(), members.begin(), members.end());
+      return;
+    }
+    target.first_child = result.children.size();
+    target.child_count = source.child_count;
+    for (std::uint64_t c = 0; c < source.child_count; ++c) {
+      result.children.push_back(mapping[p][sub.children[source.first_child + c]]);
+    }
+    TempBeaconTable table;
+    table.ordinals.assign(sub.beacon_ordinals.begin() + source.first_beacon,
+                          sub.beacon_ordinals.begin() + source.first_beacon + source.beacon_count);
+    table.distances.assign(sub.beacon_distances.begin() + source.first_distance,
+        sub.beacon_distances.begin() + source.first_distance + source.child_count * source.beacon_count);
+    persist_beacon_table(result, mapping[p][id], table);
+  };
+  for (std::size_t p = 0; p < subtrees.size(); ++p) copy_parent(p, 0);
+  for (std::size_t layer = 0; layer < config.center_radii.size(); ++layer) {
+    for (std::size_t p = 0; p < subtrees.size(); ++p) {
+      const auto& info = subtrees[p].layers[layer];
+      for (NodeId id = info.first_node; id < info.first_node + info.node_count; ++id) copy_parent(p, id);
+    }
+  }
+  return result;
 }
 
 }  // namespace navigamer

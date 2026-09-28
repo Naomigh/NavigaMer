@@ -42,6 +42,11 @@ class NavigaMerIndex {
     return {leaf_ids.data() + node.first_member, node.member_count};
   }
   [[nodiscard]] std::uint64_t bytes() const noexcept;
+  // Sorted union of descendant leaf memberships, deduplicated by occurrence ID.
+  [[nodiscard]] std::vector<SequenceId> world_members(NodeId world) const;
+  [[nodiscard]] bool is_scoped() const noexcept {
+    return nodes[root].center_sequence_id != kNoSequence;
+  }
   [[nodiscard]] std::string summary() const;
   [[nodiscard]] std::string_view member_sequence(
       std::uint64_t member, const SequenceStore& reference) const {

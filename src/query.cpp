@@ -384,10 +384,15 @@ std::vector<QueryHit> brute_force_query(const NavigaMerIndex& index,
                                       std::string_view query,
                                       std::uint32_t tolerance, bool reverse) {
   std::vector<QueryHit> hits;
-  for (SequenceId id = 0; id < index.reference_window_count; ++id) {
+  auto check = [&](SequenceId id) {
     const int distance = EditDistance::bounded(query, reference.sequence(id),
                                                static_cast<int>(tolerance));
     if (distance >= 0) hits.push_back({id, id, static_cast<std::uint32_t>(distance), reverse});
+  };
+  if (index.is_scoped()) {
+    for (const auto id : index.world_members(index.root)) check(id);
+  } else {
+    for (SequenceId id = 0; id < index.reference_window_count; ++id) check(id);
   }
   return hits;
 }

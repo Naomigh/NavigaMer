@@ -43,6 +43,65 @@ build/navigamer build \
 For four layers, use `--layers 4 --radii 75,50,30,15`. The C++ API derives
 the layer count from `BuildConfig::center_radii.size()`.
 
+## Continue or rebuild existing worlds
+
+Append new layers below **every current leaf**, without reselecting existing
+centers or changing existing membership scopes:
+
+```bash
+build/navigamer extend \
+  --reference reference.fa --input reference-layer1.nvm --index deeper.nvm \
+  --radii 60,35,15 --threads 32 --classifier adjacent
+```
+
+Alternatively, choose an existing world by its **node ID**, keep its center and
+exact member set, and rebuild its descendants from scratch:
+
+```bash
+build/navigamer rebuild-world \
+  --reference reference.fa --input deeper.nvm --world 42 --index world42.nvm \
+  --radii 50,30,15 --threads 32 --classifier adjacent
+```
+
+The selected world becomes the new root, not an additional reselected layer.
+Its old descendants are ignored; the new radii describe only layers below it.
+Greedy child selection still begins with the first member in occurrence-ID
+order, which need not be the retained root center. Node IDs are not sequence
+IDs: list selectable nodes, parents, centers and counts with
+`build/navigamer inspect --index deeper.nvm --worlds`. In the C++ API use
+`index.nodes[node].center_sequence_id` to distinguish them.
+`--world 0` on an ordinary index rebuilds the entire reference hierarchy.
+
+Both commands require a new output path and explicit `--radii`. The input file
+is unchanged; an existing output (including the input itself) is rejected.
+Window length, stride, reference limit and T are inherited from the input;
+changing T is rejected. Beacon settings describe the **new** layers only.
+The total depth after `extend` must not exceed 255 layers. These operations
+require a reference-backed v5 `.nvm` with complete leaf memberships, together
+with its matching reference FASTA. Legacy v3/v4 owned-sequence indexes must
+first be rebuilt as v5. A centers-only selection checkpoint is not sufficient.
+
+The C++ APIs are `IndexBuilder::extend` and `IndexBuilder::rebuild_world`.
+Members of an internal world are recovered by merging its sorted descendant
+leaves and deduplicating occurrence IDs, not identical sequence strings. The
+merge does not first copy all overlapping relationships. Results retain global
+reference IDs and the original reference fingerprint. A subtree index queries
+only its retained members; `verify` compares against the same restricted scope.
+`inspect` reports `scope`, `scope_members` and the retained root center ID.
+The binary format remains v5. A continued build has canonical BFS node/storage
+order, matching a one-shot build byte for byte when radii, T and per-layer beacon
+settings match. The input's previous beacon settings do not need to be supplied
+again; they are retained with their existing tables.
+
+These commands still use in-memory `.nvm` membership storage. They do **not**
+directly consume the NFS R75 compressed archive or implement disk-streaming
+continuation/checkpoint recovery. Do not convert the full R75 archive to dense
+membership vectors to use them: overlap expansion is prohibitive. Its archive
+adapter and one-pass, independently readable parent blocks require separate
+storage work; the existing R75 results are not modified by these commands.
+
+## Construction options
+
 `--beacon-ratios B1,...,BN` gives one fraction per configured layer. In the
 default three-layer hierarchy these are large centers at the root, middle
 centers inside each large world, and small centers inside each middle world.
@@ -156,6 +215,23 @@ previous scalar paths. Classification also batches complete, uncomputed groups
 of four when every lane passes beacon pruning and the bound is above 15 (or
 unbounded). It retains the same exclusive-center and nearest-distance + 2T
 membership rules. This does not add checkpointing or change index storage.
+
+`--classifier adjacent` selects the exact streaming classifier ported from the
+R75 production driver. It reuses query-to-center distance intervals, resolves
+the nearest distance exactly, then evaluates only intervals straddling `x+2T`.
+Unresolved, noncontiguous centers use gathered four-lane SIMD profiles on AVX2,
+with exact Edlib fallback on unsupported CPUs or disabled SIMD builds. The
+driver's eight-lane AVX-512 binary ABI is not copied into this four-lane library.
+Bounds use the actual same-contig coordinate gap (`2s`), supporting strided and
+filtered parent memberships. Contig boundaries reset the cache; equal windows
+reuse ordinary memberships. Center exclusivity is checked by occurrence ID
+before cache reuse, including when `radius <= 2T`. Each worker has its own cache.
+Beacon tables are still built for query routing, but are not consulted by this
+classifier. `classification_repeated` counts identical-window reuse;
+`pruned_center_pairs` includes interval/cache skips in this mode. The default
+`--classifier beacon` retains the existing tiled beacon-pruning classifier.
+The two classifiers produce identical memberships, but neither is guaranteed
+faster on every dataset. Both work with `build`, `extend` and `rebuild-world`.
 
 Lower-layer parents are independent build tasks. Results are merged in parent
 order. Threads are divided between outer parent tasks and inner selection and

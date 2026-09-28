@@ -4,6 +4,7 @@
 #include <algorithm>
 #include <array>
 #include <chrono>
+#include <filesystem>
 #include <fstream>
 #include <iomanip>
 #include <iostream>
@@ -201,7 +202,7 @@ void print_batch_stats(const BatchResult& result, std::uint64_t queries, std::ui
   std::cout << '\n';
 }
 
-void command_build(const Arguments& args) {
+navigamer::BuildConfig build_config(const Arguments& args, std::uint32_t tolerance = 5) {
   navigamer::BuildConfig config;
   config.center_radii = values_list<std::uint32_t>(args.get("--radii", "60,35,15"));
   const auto layer_count = config.center_radii.size();
@@ -229,17 +230,18 @@ void command_build(const Arguments& args) {
       throw std::invalid_argument("--beacon-cover-radii requires one value per layer");
     }
   }
-  config.max_tolerance = integer32(args, "--T", 5);
+  config.max_tolerance = integer32(args, "--T", tolerance);
   config.threads = worker_count(
       args, std::max(1u, std::thread::hardware_concurrency()));
-  auto reference = navigamer::SequenceStore::from_fasta(args.get("--reference"),
-      integer32(args, "--window", 150), integer32(args, "--stride", 1),
-      args.integer("--limit", 0));
-  navigamer::BuildStats stats;
-  const auto start = Clock::now();
-  auto index = navigamer::IndexBuilder::build(reference, config, &stats);
-  const auto built = Clock::now();
-  index.save(args.get("--index"));
+  const auto classifier = args.get("--classifier", "beacon");
+  if (classifier == "adjacent") config.classification_mode = navigamer::ClassificationMode::kAdjacent;
+  else if (classifier != "beacon") throw std::invalid_argument("--classifier must be beacon or adjacent");
+  return config;
+}
+
+void print_build_stats(const NavigaMerIndex& index, const navigamer::BuildStats& stats,
+                       Clock::time_point start, Clock::time_point built,
+                       std::size_t layer_offset = 0) {
   std::cout << std::fixed << std::setprecision(6) << index.summary();
   constexpr std::array<std::string_view, 3> names{"large", "middle", "small"};
   for (std::size_t layer = 0; layer < stats.layers.size(); ++layer) {
@@ -249,8 +251,9 @@ void command_build(const Arguments& args) {
     const double pruning_ratio = value.classification_center_pairs == 0 ? 0.0 :
         static_cast<double>(value.pruned_center_pairs) /
         static_cast<double>(value.classification_center_pairs);
-    std::cout << "build_layer=" << (layer_count == 3 ? std::string(names[layer]) : std::to_string(layer))
-        << " layer_index=" << layer
+    const auto layer_index = layer + layer_offset;
+    std::cout << "build_layer=" << (index.layers.size() == 3 ? std::string(names[layer_index]) : std::to_string(layer_index))
+        << " layer_index=" << layer_index
         << " center_selection_seconds=" << value.center_selection_seconds
         << " beacon_table_seconds=" << value.beacon_table_seconds
         << " classification_seconds=" << value.classification_seconds
@@ -268,12 +271,84 @@ void command_build(const Arguments& args) {
         << " classification_center_pairs=" << value.classification_center_pairs
         << " pruned_center_pairs=" << value.pruned_center_pairs
         << " pruning_ratio=" << pruning_ratio
-        << " classified_members=" << value.classified_members << '\n';
+        << " classified_members=" << value.classified_members
+        << " classification_repeated=" << value.classification_repeated << '\n';
   }
   std::cout
       << "build_seconds=" << std::chrono::duration<double>(built - start).count()
       << " save_seconds=" << std::chrono::duration<double>(Clock::now() - built).count()
       << " peak_rss_bytes=" << peak_rss_bytes() << '\n';
+}
+
+void command_build(const Arguments& args) {
+  const auto config = build_config(args);
+  auto reference = navigamer::SequenceStore::from_fasta(args.get("--reference"),
+      integer32(args, "--window", 150), integer32(args, "--stride", 1),
+      args.integer("--limit", 0));
+  navigamer::BuildStats stats;
+  const auto start = Clock::now();
+  auto index = navigamer::IndexBuilder::build(reference, config, &stats);
+  const auto built = Clock::now();
+  index.save(args.get("--index"));
+  print_build_stats(index, stats, start, built);
+}
+
+void command_continue(const Arguments& args, bool rebuild) {
+  if (args.get("--input").empty() || args.get("--index").empty()) {
+    throw std::invalid_argument("--input and a new --index output are required");
+  }
+  if (std::filesystem::exists(args.get("--index"))) {
+    throw std::invalid_argument("output index already exists; use a new path to preserve previous results");
+  }
+  if (!args.has("--radii")) throw std::invalid_argument("new child --radii must be explicit");
+  if (args.has("--window") || args.has("--stride") || args.has("--limit")) {
+    throw std::invalid_argument("window, stride and reference limit are inherited from --input");
+  }
+  if (rebuild != args.has("--world")) {
+    throw std::invalid_argument("--world is required only for rebuild-world; extend appends to all leaves");
+  }
+  const auto selected = rebuild ? values_list<navigamer::NodeId>(args.get("--world"))
+                                : std::vector<navigamer::NodeId>{0};
+  if (selected.size() != 1) throw std::invalid_argument("--world requires one node ID");
+  const auto input = NavigaMerIndex::load(args.get("--input"));
+  const auto reference = load_reference(args, input);
+  const auto config = build_config(args, input.max_tolerance);
+  navigamer::BuildStats stats;
+  const auto start = Clock::now();
+  auto index = rebuild
+      ? navigamer::IndexBuilder::rebuild_world(reference, input,
+          selected[0], config, &stats)
+      : navigamer::IndexBuilder::extend(reference, input, config, &stats);
+  const auto built = Clock::now();
+  index.save(args.get("--index"));
+  print_build_stats(index, stats, start, built, rebuild ? 0 : input.layers.size());
+}
+
+void command_inspect(const Arguments& args) {
+  const auto index = NavigaMerIndex::load(args.get("--index"));
+  std::cout << index.summary();
+  if (!args.has("--worlds")) return;
+  std::vector<navigamer::NodeId> parents(index.nodes.size(), navigamer::kNoNode);
+  for (navigamer::NodeId id = 0; id < index.nodes.size(); ++id) {
+    const auto& node = index.nodes[id];
+    for (std::uint64_t c = 0; c < node.child_count; ++c) {
+      parents[index.children[node.first_child + c]] = id;
+    }
+  }
+  std::cout << "node_id\tparent_id\tlayer\tcenter_sequence_id\tmembers\tchildren\n";
+  for (navigamer::NodeId id = 0; id < index.nodes.size(); ++id) {
+    const auto& node = index.nodes[id];
+    std::cout << id << '\t';
+    if (parents[id] == navigamer::kNoNode) std::cout << '-';
+    else std::cout << parents[id];
+    std::cout << '\t';
+    if (node.layer == navigamer::kRootLayer) std::cout << "root";
+    else std::cout << static_cast<unsigned>(node.layer);
+    std::cout << '\t';
+    if (node.center_sequence_id == navigamer::kNoSequence) std::cout << '-';
+    else std::cout << node.center_sequence_id;
+    std::cout << '\t' << node.member_count << '\t' << node.child_count << '\n';
+  }
 }
 
 std::uint64_t min_queries_per_thread(const Arguments& args) {
@@ -374,12 +449,20 @@ void usage() {
   std::cout << "NavigaMer\n"
       "  build --reference ref.fa --index out.nvm [--window 150] [--stride 1]"
       " [--T 5] [--layers N] [--radii R1,...,RN]"
-      " [--beacon-ratios B1,...,BN | --beacon-cover-radii C1,...,CN] [--threads N]\n"
+      " [--beacon-ratios B1,...,BN | --beacon-cover-radii C1,...,CN] [--threads N]"
+      " [--classifier beacon|adjacent]\n"
       "    Defaults: 3 layers, radii 60,35,15, beacon ratio 0.1 per layer.\n"
+      "  extend --reference ref.fa --input old.nvm --index new.nvm --radii R1,...,RN"
+      " [--threads N] [--classifier beacon|adjacent]"
+      " [--beacon-ratios B1,...,BN | --beacon-cover-radii C1,...,CN]\n"
+      "    Preserve the hierarchy and append below all current leaves.\n"
+      "  rebuild-world --reference ref.fa --input old.nvm --world NODE --index new.nvm"
+      " --radii R1,...,RN [--threads N] [--classifier beacon|adjacent]\n"
+      "    Keep this world's center/members; replace its descendants in a new index.\n"
       "  query --reference ref.fa --index out.nvm --queries reads.fa"
       " [--tolerance T] [--route multilateration|scan] [--threads N]"
       " [--min-queries-per-thread N] [--output hits.tsv]\n"
-      "  inspect --index out.nvm\n"
+      "  inspect --index out.nvm [--worlds]\n"
       "  verify --reference ref.fa --index out.nvm --queries reads.fa [--limit 100]\n"
       "  benchmark --reference ref.fa --index out.nvm --queries reads.fa"
       " [--repeat N] [--warmup N] [--threads N] [--min-queries-per-thread N]\n";
@@ -392,8 +475,10 @@ int main(int argc, char** argv) {
     const std::string command = argc == 1 ? "help" : argv[1];
     const Arguments args(argc, argv);
     if (command == "build") command_build(args);
+    else if (command == "extend") command_continue(args, false);
+    else if (command == "rebuild-world") command_continue(args, true);
     else if (command == "query") command_query(args);
-    else if (command == "inspect") std::cout << NavigaMerIndex::load(args.get("--index")).summary();
+    else if (command == "inspect") command_inspect(args);
     else if (command == "verify") return command_verify(args);
     else if (command == "benchmark") command_benchmark(args);
     else usage();
