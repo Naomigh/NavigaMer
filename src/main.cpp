@@ -1,5 +1,9 @@
 #include "navigamer/builder.hpp"
 #include "navigamer/query.hpp"
+#ifdef NAVIGAMER_HAVE_ARCHIVE
+#include "navigamer/archive.hpp"
+#include <csignal>
+#endif
 
 #include <algorithm>
 #include <array>
@@ -351,6 +355,67 @@ void command_inspect(const Arguments& args) {
   }
 }
 
+#ifdef NAVIGAMER_HAVE_ARCHIVE
+volatile std::sig_atomic_t archive_stop = 0;
+void stop_archive(int) { archive_stop = 1; }
+
+int command_archive_build(const Arguments& args) {
+  if (args.get("--input").empty() || args.get("--output").empty() || !args.has("--radii")) {
+    throw std::invalid_argument("extend-archive requires --input, --output and explicit --radii");
+  }
+  if (args.has("--window") || args.has("--stride") || args.has("--limit") || args.has("--T") || args.has("--layers") ||
+      args.has("--beacon-ratios") || args.has("--beacon-cover-radii")) {
+    throw std::invalid_argument("archive reference parameters/T are inherited; archive routing does not use beacon tables");
+  }
+  navigamer::ArchiveBuildConfig config;
+  config.radii = values_list<std::uint32_t>(args.get("--radii"));
+  auto unsigned_option = [&](const std::string& key, std::uint64_t fallback) {
+    if (!args.has(key)) return fallback;
+    const auto values = values_list<std::uint64_t>(args.get(key));
+    if (values.size() != 1) throw std::invalid_argument(key + " requires one unsigned integer");
+    return values[0];
+  };
+  const auto threads = unsigned_option("--threads", std::max(1u, std::thread::hardware_concurrency()));
+  if (threads == 0 || threads > 4096) throw std::invalid_argument("--threads must be between 1 and 4096");
+  config.threads = threads;
+  config.working_memory_mib = unsigned_option("--memory-mib", 1024);
+  config.checkpoint_members = unsigned_option("--checkpoint-members", 1000000);
+  config.resume = args.has("--resume"); config.copy_input = args.has("--copy-input");
+  if (args.has("--world")) {
+    const auto ids = values_list<navigamer::NodeId>(args.get("--world"));
+    if (ids.size() != 1) throw std::invalid_argument("--world requires one archive node/legacy ordinal");
+    config.world = ids[0];
+  }
+  const auto parameters = navigamer::ArchiveBuilder::input_metadata(args.get("--input"));
+  const auto reference = navigamer::SequenceStore::from_fasta(args.get("--reference"),
+      parameters.window, parameters.stride, parameters.reference_windows);
+  std::signal(SIGINT, stop_archive); std::signal(SIGTERM, stop_archive);
+  config.stop_requested = [] { return archive_stop != 0; };
+  const auto start = Clock::now();
+  const bool complete = navigamer::ArchiveBuilder::extend(reference, args.get("--input"), args.get("--output"), config);
+  if (complete) std::cout << navigamer::ArchiveIndex::open(args.get("--output")).summary();
+  else std::cout << "complete=false checkpoint_saved=true resume_with=--resume\n";
+  std::cout << "archive_build_seconds=" << std::chrono::duration<double>(Clock::now() - start).count()
+            << " peak_rss_bytes=" << peak_rss_bytes() << '\n';
+  return complete ? 0 : 130;
+}
+
+void command_archive_inspect(const Arguments& args) {
+  const auto archive = navigamer::ArchiveIndex::open(args.get("--input"));
+  std::cout << archive.summary();
+  if (!args.has("--worlds")) return;
+  std::cout << "node_id\tparent_id\tdepth\tcenter_sequence_id\tmembers\tchildren\n";
+  for (navigamer::NodeId id = 0; id < archive.metadata().nodes; ++id) {
+    const auto node = archive.node(id);
+    std::cout << id << '\t';
+    if (node.parent == navigamer::kNoNode) std::cout << '-'; else std::cout << node.parent;
+    std::cout << '\t' << node.depth << '\t';
+    if (node.center == navigamer::kNoSequence) std::cout << '-'; else std::cout << node.center;
+    std::cout << '\t' << node.members.count << '\t' << node.child_count << '\n';
+  }
+}
+#endif
+
 std::uint64_t min_queries_per_thread(const Arguments& args) {
   if (args.has("--min-queries-per-thread") && args.has("--block-size")) {
     throw std::invalid_argument("use --min-queries-per-thread or its --block-size alias, not both");
@@ -459,6 +524,11 @@ void usage() {
       "  rebuild-world --reference ref.fa --input old.nvm --world NODE --index new.nvm"
       " --radii R1,...,RN [--threads N] [--classifier beacon|adjacent]\n"
       "    Keep this world's center/members; replace its descendants in a new index.\n"
+      "  extend-archive --reference ref.fa --input R75_DIRECTORY --output NEW_DIRECTORY"
+      " --radii R1,...,RN [--world ID] [--threads N] [--memory-mib 1024]"
+      " [--checkpoint-members 1000000] [--resume] [--copy-input]\n"
+      "    Legacy R75 world IDs are center ordinals; new archive world IDs are node IDs.\n"
+      "  inspect-archive --input ARCHIVE_DIRECTORY [--worlds]\n"
       "  query --reference ref.fa --index out.nvm --queries reads.fa"
       " [--tolerance T] [--route multilateration|scan] [--threads N]"
       " [--min-queries-per-thread N] [--output hits.tsv]\n"
@@ -477,6 +547,14 @@ int main(int argc, char** argv) {
     if (command == "build") command_build(args);
     else if (command == "extend") command_continue(args, false);
     else if (command == "rebuild-world") command_continue(args, true);
+#ifdef NAVIGAMER_HAVE_ARCHIVE
+    else if (command == "extend-archive") return command_archive_build(args);
+    else if (command == "inspect-archive") command_archive_inspect(args);
+#else
+    else if (command == "extend-archive" || command == "inspect-archive") {
+      throw std::runtime_error("archive support requires a build with Zstd headers and library");
+    }
+#endif
     else if (command == "query") command_query(args);
     else if (command == "inspect") command_inspect(args);
     else if (command == "verify") return command_verify(args);

@@ -35,6 +35,11 @@ BatchDistance::BatchDistance(std::size_t length)
   }
 }
 
+std::uint64_t BatchDistance::bytes() const noexcept {
+  return sizeof(*this) + centers_.capacity() * sizeof(std::string)
+      + groups_.capacity() * sizeof(Group) + mask_bytes_ + string_bytes_;
+}
+
 void BatchDistance::append(std::string_view center) {
   if (center.size() != length_) {
     throw std::invalid_argument("batch centers must have equal length");
@@ -43,6 +48,7 @@ void BatchDistance::append(std::string_view center) {
     const auto lane = size() % kLanes;
     if (lane == 0) groups_.emplace_back();
     auto& group = groups_.back();
+    const auto old_capacity = group.masks.capacity();
     for (std::size_t position = 0; position < length_; ++position) {
       auto& symbol = group.symbols[static_cast<unsigned char>(center[position])];
       if (symbol == 256) {
@@ -54,8 +60,10 @@ void BatchDistance::append(std::string_view center) {
       group.masks[(symbol * block_count_ + position / 64) * kLanes + lane] |=
           std::uint64_t{1} << (position % 64);
     }
+    mask_bytes_ += (group.masks.capacity() - old_capacity) * sizeof(std::uint64_t);
   }
   centers_.emplace_back(center);
+  string_bytes_ += centers_.back().capacity();
 }
 
 std::array<int, BatchDistance::kLanes> BatchDistance::exact_group(

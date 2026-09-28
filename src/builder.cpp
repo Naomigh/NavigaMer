@@ -1,13 +1,13 @@
 #include "navigamer/builder.hpp"
 
 #include "navigamer/batch_distance.hpp"
+#include "navigamer/center_selector.hpp"
 #include "navigamer/edit_distance.hpp"
 #include "navigamer/member_classifier.hpp"
 #include "navigamer/prefetch.hpp"
 
 #include <algorithm>
 #include <atomic>
-#include <barrier>
 #include <chrono>
 #include <cmath>
 #include <exception>
@@ -73,143 +73,17 @@ CenterSelection choose_centers(const SequenceStore& reference,
                                const std::vector<SequenceId>& members,
                                std::uint32_t radius,
                                LayerBuildStats& stats, std::uint32_t threads = 1) {
-  CenterSelection selected{{members[0]}, {0}, PackedCenters(reference.window_length())};
-  selected.sequences.append(reference.sequence(members[0]));
-  if (radius >= reference.window_length()) return selected;
-  const bool use_batch = radius > EditDistance::kLeapMaxDistance && BatchDistance::simd_available();
-  BatchDistance batch(reference.window_length());
-  if (use_batch) batch.append(reference.sequence(members[0]));
-  struct Hint {
-    std::size_t center = std::numeric_limits<std::size_t>::max();
-    std::uint32_t upper = 0;
-    std::pair<std::string_view, std::uint64_t> location;
-  };
-  auto covered = [&](std::size_t i, std::size_t first, std::size_t last,
-                     Hint& hint, std::string& scratch, BatchDistance::Workspace& workspace,
-                     LayerBuildStats& local) {
-    if (first == last) return false;
-    const bool valid_hint = hint.center >= first && hint.center < last;
-    const auto location = reference.location(members[i]);
-    // Same-contig windows separated by s bases differ by at most 2s edits.
-    // Compare name addresses, not text: distinct contigs can share a name.
-    if (valid_hint && location.first.data() == hint.location.first.data()) {
-      const auto shift = location.second >= hint.location.second
-          ? location.second - hint.location.second : hint.location.second - location.second;
-      if (shift <= (radius - hint.upper) / 2) {
-        hint.upper += 2 * shift;
-        hint.location = location;
-        ++local.center_bound_accepts;
-        return true;
-      }
-    }
-    const auto sequence = reference.sequence(members[i]);
-    PreparedQuery query(sequence);
-    if (valid_hint) {
-      ++local.center_edit_calls;
-      const auto d = query.distance(selected.sequences, hint.center, scratch, radius);
-      if (d >= 0) {
-        hint.upper = d;
-        hint.location = location;
-        ++local.center_hint_hits;
-        return true;
-      }
-    }
-    for (std::size_t c = first; c < last; ++c) {
-      if (use_batch && c % BatchDistance::kLanes == 0 && last - c >= BatchDistance::kLanes) {
-        const auto distances = batch.exact_group(sequence, c / BatchDistance::kLanes, workspace);
-        local.center_edit_calls += BatchDistance::kLanes;
-        ++local.center_batch_groups;
-        for (std::size_t lane = 0; lane < BatchDistance::kLanes; ++lane) {
-          if (distances[lane] <= static_cast<int>(radius)) {
-            hint = {c + lane, static_cast<std::uint32_t>(distances[lane]), location};
-            return true;
-          }
-        }
-        c += BatchDistance::kLanes - 1;
-        continue;
-      }
-      if (valid_hint && c == hint.center) continue;
-      ++local.center_edit_calls;
-      const auto d = query.distance(selected.sequences, c, scratch, radius);
-      if (d >= 0) {
-        hint = {c, static_cast<std::uint32_t>(d), location};
-        return true;
-      }
-    }
-    return false;
-  };
-  auto append = [&](std::size_t i, Hint& hint) {
-    selected.ids.push_back(members[i]);
-    selected.member_ordinals.push_back(i);
-    selected.sequences.append(reference.sequence(members[i]));
-    if (use_batch) batch.append(reference.sequence(members[i]));
-    hint = {selected.ids.size() - 1, 0, reference.location(members[i])};
-  };
-  Hint serial_hint{0, 0, reference.location(members[0])};
-  std::string serial_scratch;
-  BatchDistance::Workspace serial_workspace;
-  constexpr std::size_t batch_size = 4096;
-  if (threads == 1 || members.size() < batch_size) {
-    for (std::size_t i = 1; i < members.size(); ++i) {
-      if (!covered(i, 0, selected.ids.size(), serial_hint, serial_scratch, serial_workspace, stats)) {
-        append(i, serial_hint);
-      }
-    }
-    return selected;
+  CenterSelector selector(reference, radius, members.size() < 4096 ? 1 : threads);
+  selector.consume(members);
+  CenterSelection selected{selector.centers(), {}, selector.sequences()};
+  for (const auto id : selected.ids) {
+    selected.member_ordinals.push_back(std::lower_bound(members.begin(), members.end(), id) - members.begin());
   }
-
-  // Workers check an immutable center snapshot. Only the serial merge adds
-  // centers, in input order, after checking survivors against newly added ones.
-  const auto worker_count = active_workers(batch_size, threads);
-  std::vector<Hint> hints(worker_count);
-  std::vector<std::string> scratch(worker_count);
-  std::vector<BatchDistance::Workspace> workspaces(worker_count);
-  std::vector<LayerBuildStats> worker_stats(worker_count);
-  std::vector<std::uint8_t> accepted(batch_size);
-  std::barrier sync(static_cast<std::ptrdiff_t>(worker_count));
-  std::size_t begin = 1, end = 1, snapshot_count = 0;
-  bool stop = false;
-  auto scan = [&](std::size_t worker) {
-    const auto first = begin + (end - begin) * worker / worker_count;
-    const auto last = begin + (end - begin) * (worker + 1) / worker_count;
-    for (auto i = first; i < last; ++i) {
-      accepted[i - begin] = covered(i, 0, snapshot_count, hints[worker],
-                                    scratch[worker], workspaces[worker], worker_stats[worker]);
-    }
-  };
-  std::vector<std::thread> workers;
-  for (std::size_t worker = 1; worker < worker_count; ++worker) {
-    workers.emplace_back([&, worker] {
-      for (;;) {
-        sync.arrive_and_wait();
-        if (stop) return;
-        scan(worker);
-        sync.arrive_and_wait();
-      }
-    });
-  }
-  for (; begin < members.size(); begin = end) {
-    end = begin + std::min(batch_size, members.size() - begin);
-    snapshot_count = selected.ids.size();
-    sync.arrive_and_wait();
-    scan(0);
-    sync.arrive_and_wait();
-    for (auto i = begin; i < end; ++i) {
-      if (!accepted[i - begin] &&
-          !covered(i, snapshot_count, selected.ids.size(), serial_hint, serial_scratch, serial_workspace, stats)) {
-        append(i, serial_hint);
-      }
-    }
-  }
-  stop = true;
-  sync.arrive_and_wait();
-  for (auto& worker : workers) worker.join();
-  for (const auto& local : worker_stats) {
-    stats.center_edit_calls += local.center_edit_calls;
-    stats.center_bound_accepts += local.center_bound_accepts;
-    stats.center_hint_hits += local.center_hint_hits;
-    stats.center_batch_groups += local.center_batch_groups;
-  }
+  const auto& value = selector.stats();
+  stats.center_edit_calls += value.center_edit_calls;
+  stats.center_bound_accepts += value.center_bound_accepts;
+  stats.center_hint_hits += value.center_hint_hits;
+  stats.center_batch_groups += value.center_batch_groups;
   return selected;
 }
 

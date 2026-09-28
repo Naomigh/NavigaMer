@@ -9,6 +9,7 @@ find_package(Threads REQUIRED)
 option(NAVIGAMER_NATIVE "Tune optimized builds for the current CPU" OFF)
 option(NAVIGAMER_ENABLE_LEAP "Use LEAP for small bounded edit distances" ON)
 option(NAVIGAMER_ENABLE_BATCH_MYERS "Use runtime-dispatched AVX2 batch center distances" ON)
+option(NAVIGAMER_ENABLE_ARCHIVE "Build disk-backed compressed archive support (requires Zstd)" ON)
 
 add_library(edlib STATIC third_party/edlib/src/edlib.cpp)
 target_include_directories(edlib PUBLIC third_party/edlib/include)
@@ -37,6 +38,7 @@ add_library(navigamer_core
   src/edit_distance.cpp
   src/batch_distance.cpp
   src/member_classifier.cpp
+  src/center_selector.cpp
   src/index.cpp
   src/builder.cpp
   src/query.cpp
@@ -70,8 +72,36 @@ endif()
 add_executable(navigamer src/main.cpp)
 target_link_libraries(navigamer PRIVATE navigamer_core)
 
+if(NAVIGAMER_ENABLE_ARCHIVE)
+  find_path(ZSTD_INCLUDE_DIR zstd.h)
+  find_library(ZSTD_LIBRARY NAMES zstd)
+  if(ZSTD_INCLUDE_DIR AND ZSTD_LIBRARY)
+    add_library(navigamer_archive src/archive_storage.cpp src/archive_builder.cpp)
+    target_include_directories(navigamer_archive PRIVATE ${ZSTD_INCLUDE_DIR})
+    target_link_libraries(navigamer_archive PUBLIC navigamer_core PRIVATE ${ZSTD_LIBRARY})
+    target_compile_options(navigamer_archive PRIVATE $<$<CXX_COMPILER_ID:GNU,Clang>:-Wall;-Wextra;-Wpedantic>)
+    target_link_libraries(navigamer PRIVATE navigamer_archive)
+    target_compile_definitions(navigamer PRIVATE NAVIGAMER_HAVE_ARCHIVE=1)
+  else()
+    message(WARNING "Zstd headers/library not found: archive commands disabled. Set CMAKE_PREFIX_PATH or ZSTD_INCLUDE_DIR and ZSTD_LIBRARY to enable them.")
+  endif()
+endif()
+
 include(CTest)
 if(BUILD_TESTING)
+  if(TARGET navigamer_archive)
+    add_executable(navigamer_archive_tests tests/test_archive.cpp)
+    target_include_directories(navigamer_archive_tests PRIVATE src ${ZSTD_INCLUDE_DIR})
+    target_link_libraries(navigamer_archive_tests PRIVATE navigamer_archive ${ZSTD_LIBRARY})
+    target_compile_options(navigamer_archive_tests PRIVATE $<$<CXX_COMPILER_ID:GNU,Clang>:-UNDEBUG>)
+    add_test(NAME navigamer_archive_tests COMMAND navigamer_archive_tests ${CMAKE_CURRENT_BINARY_DIR}/archive-test-data)
+    set_tests_properties(navigamer_archive_tests PROPERTIES FIXTURES_SETUP archive_data)
+    add_test(NAME navigamer_archive_cli_test COMMAND ${CMAKE_COMMAND}
+      -DNAVIGAMER=$<TARGET_FILE:navigamer>
+      -DTEST_DIR=${CMAKE_CURRENT_BINARY_DIR}/archive-test-data
+      -P ${CMAKE_CURRENT_SOURCE_DIR}/tests/archive_cli_test.cmake)
+    set_tests_properties(navigamer_archive_cli_test PROPERTIES FIXTURES_REQUIRED archive_data)
+  endif()
   add_executable(navigamer_tests tests/test_navigamer.cpp)
   target_link_libraries(navigamer_tests PRIVATE navigamer_core)
   target_compile_options(navigamer_tests PRIVATE

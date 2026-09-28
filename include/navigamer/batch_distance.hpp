@@ -35,6 +35,7 @@ class BatchDistance {
   [[nodiscard]] std::array<int, kLanes> exact_selected(
       std::string_view target, std::span<const std::size_t> selected, Workspace& workspace) const;
   [[nodiscard]] std::size_t size() const noexcept { return centers_.size(); }
+  [[nodiscard]] std::uint64_t bytes() const noexcept;
   [[nodiscard]] static bool simd_available() noexcept;
 
  private:
@@ -49,6 +50,7 @@ class BatchDistance {
       const std::vector<std::uint64_t>& masks, Workspace& workspace) const;
   std::size_t length_, block_count_;
   std::uint64_t padding_mask_;
+  std::uint64_t mask_bytes_{0}, string_bytes_{0};
   std::vector<std::string> centers_;
   std::vector<Group> groups_;
 };
