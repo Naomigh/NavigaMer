@@ -61,11 +61,13 @@ class ArchiveMemberReader {
 
 struct ArchiveBuildConfig {
   std::vector<std::uint32_t> radii;
+  // A changed T reclassifies legacy first-layer centers over the full reference.
+  std::optional<std::uint32_t> tolerance;
   std::uint32_t threads{1};
   // Temporary heap buffers, excluding the immutable reference and thread stacks.
   std::uint64_t working_memory_mib{1024};
   std::uint64_t checkpoint_members{1000000};
-  // Legacy R75: zero-based center ordinal. New archive: node ID.
+  // Legacy R75/R90: zero-based center ordinal. New archive: node ID.
   std::optional<NodeId> world;
   bool resume{false};
   bool copy_input{false};  // Explicit cross-filesystem fallback to hard links.

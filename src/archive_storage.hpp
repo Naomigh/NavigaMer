@@ -79,9 +79,10 @@ class MemberWriter {
   std::uint64_t position_{64}, last_space_check_{0};
 };
 
-// Strict, read-only compatibility with the R75 production archive (V1).
+// Strict, read-only compatibility with the R75/R90 production archive (V1).
 struct LegacyCenters {
   std::uint64_t fingerprint, windows, center_hash;
+  std::uint32_t radius;
   std::vector<SequenceId> ids;
   explicit LegacyCenters(const std::filesystem::path& directory, std::uint64_t memory_limit = UINT64_MAX);
 };

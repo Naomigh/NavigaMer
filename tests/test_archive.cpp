@@ -2,12 +2,14 @@
 #include "navigamer/builder.hpp"
 #include "navigamer/center_selector.hpp"
 #include "archive_storage.hpp"
+#include "archive_prefetch.hpp"
 
 #include <algorithm>
 #include <cassert>
 #include <bit>
 #include <chrono>
 #include <fstream>
+#include <future>
 #include <iomanip>
 #include <iostream>
 #include <numeric>
@@ -32,6 +34,7 @@ std::vector<SequenceId> all_members(const ArchiveIndex& archive, NodeId node, st
   return result;
 }
 void compare(const ArchiveIndex& actual, const NavigaMerIndex& expected) {
+  assert(actual.metadata().tolerance == expected.max_tolerance);
   assert(actual.metadata().nodes == expected.nodes.size());
   assert(actual.metadata().radii.size() == expected.layers.size());
   for (std::size_t i = 0; i < expected.layers.size(); ++i) assert(actual.metadata().radii[i] == expected.layers[i].selection_radius);
@@ -56,6 +59,44 @@ template <typename Function> void rejected(Function function) {
   bool failed = false;
   try { function(); } catch (const std::exception&) { failed = true; }
   assert(failed);
+}
+
+void test_prefetch() {
+  std::promise<void> second_started, release_second;
+  auto started = second_started.get_future();
+  auto release = release_second.get_future();
+  unsigned calls = 0;
+  MemberPrefetch batches([&]() -> std::vector<SequenceId> {
+    switch (calls++) {
+      case 0: return {1, 2};
+      case 1: second_started.set_value(); release.wait(); return {3};
+      default: return {};
+    }
+  });
+  const auto first = batches.next();
+  assert((first == std::vector<SequenceId>{1, 2}));
+  // The next read starts while the consumer still owns the current batch.
+  assert(started.wait_for(std::chrono::seconds(5)) == std::future_status::ready);
+  release_second.set_value();
+  assert((batches.next() == std::vector<SequenceId>{3}));
+  assert(batches.next().empty());
+  assert(batches.next().empty());
+
+  unsigned reads = 0;
+  MemberPrefetch broken([&]() -> std::vector<SequenceId> {
+    if (reads++ == 0) return {4};
+    throw std::runtime_error("prefetch read failed");
+  });
+  assert((broken.next() == std::vector<SequenceId>{4}));
+  try { (void)broken.next(); assert(false); }
+  catch (const std::runtime_error& error) { assert(std::string_view(error.what()) == "prefetch read failed"); }
+
+  const auto consumer = std::this_thread::get_id();
+  MemberPrefetch single_batch([&]() -> std::vector<SequenceId> {
+    assert(std::this_thread::get_id() == consumer);
+    return {5};
+  }, false);
+  assert((single_batch.next() == std::vector<SequenceId>{5}));
 }
 
 void flip_byte(const std::filesystem::path& path, std::uint64_t offset) {
@@ -88,7 +129,7 @@ void test_corruption(const std::filesystem::path& complete_path, const std::file
 }
 
 void legacy_fixture(const std::filesystem::path& directory, const SequenceStore& reference,
-                    const NavigaMerIndex& first) {
+                    const NavigaMerIndex& first, std::uint32_t radius = 75) {
   std::filesystem::create_directories(directory / "memberships" / "chunks");
   std::vector<SequenceId> centers;
   for (NodeId id = 1; id < first.nodes.size(); ++id) centers.push_back(first.nodes[id].center_sequence_id);
@@ -97,7 +138,7 @@ void legacy_fixture(const std::filesystem::path& directory, const SequenceStore&
     std::ofstream out(directory / "checkpoint.bin", std::ios::binary);
     for (const auto value : {std::uint64_t{0x31504b43353752ULL}, reference.fingerprint(), reference.size(),
                             reference.size(), std::uint64_t(centers.size()), center_hash}) write(out, value);
-    for (const auto value : {75u, 5u, 150u, 1u}) write(out, value);
+    for (const auto value : {radius, 5u, 150u, 1u}) write(out, value);
     write(out, 0.0);
     for (const auto center : centers) write(out, center);
   }
@@ -122,7 +163,7 @@ void legacy_fixture(const std::filesystem::path& directory, const SequenceStore&
     std::ostringstream name; name << std::setw(12) << std::setfill('0') << first_window << ".r75z";
     std::ofstream out(directory / "memberships" / "chunks" / name.str(), std::ios::binary);
     for (const auto value : {std::uint64_t{0x314b4e4843353752ULL}, std::uint64_t{1}, reference.fingerprint(), center_hash,
-        reference.size(), std::uint64_t(centers.size()), first_window, count, std::uint64_t{75}, std::uint64_t{5},
+        reference.size(), std::uint64_t(centers.size()), first_window, count, std::uint64_t(radius), std::uint64_t{5},
         std::uint64_t{150}, std::uint64_t{1}, std::uint64_t(std::accumulate(counts.begin(), counts.end(), std::uint64_t{0})),
         std::uint64_t(raw.size()), std::uint64_t(compressed_size), std::uint64_t{0}}) write(out, value);
     for (const auto value : counts) write(out, value);
@@ -292,6 +333,52 @@ void test_builds(const std::filesystem::path& input, const std::filesystem::path
   rejected([&] { ArchiveBuilder::extend(wrong_reference, input, run / "bad-reference", config); });
 }
 
+void test_changed_tolerance(const std::filesystem::path& input, const std::filesystem::path& run,
+                            const SequenceStore& reference) {
+  BuildConfig original; original.center_radii = {90};
+  auto rebuilt = original; rebuilt.max_tolerance = 3; rebuilt.center_radii.assign(6, 90);
+  const auto first = IndexBuilder::build(reference, original);
+  const auto expected = IndexBuilder::build(reference, rebuilt);
+  // Occurrence 1 is 70 edits from the A center and 80 from the C center:
+  // T=5 includes both, whereas T=3 excludes it from the C world.
+  const auto old_c = first.world_members(2), new_c = expected.world_members(2);
+  assert(std::binary_search(old_c.begin(), old_c.end(), SequenceId{1}));
+  assert(!std::binary_search(new_c.begin(), new_c.end(), SequenceId{1}));
+  for (const auto threads : {1u, 4u}) {
+    ArchiveBuildConfig config; config.radii.assign(5, 90); config.tolerance = 3;
+    config.threads = threads; config.working_memory_mib = 16; config.checkpoint_members = 1;
+    const auto output = run / ("t3-r90x6-" + std::to_string(threads));
+    assert(ArchiveBuilder::extend(reference, input, output, config));
+    const auto actual = ArchiveIndex::open(output); compare(actual, expected);
+    const auto root = actual.node(0);
+    assert(root.child_count == first.nodes[0].child_count);
+    for (std::size_t c = 0; c < root.child_count; ++c) {
+      assert(actual.node(root.first_child + c).center == first.nodes[c + 1].center_sequence_id);
+    }
+    for (const auto stop_at : {1, 3}) {
+      auto interrupted = config; int calls = 0;
+      interrupted.stop_requested = [&] { return ++calls == stop_at; };
+      const auto paused = run / ("t3-stop-" + std::to_string(threads) + "-" + std::to_string(stop_at));
+      assert(!ArchiveBuilder::extend(reference, input, paused, interrupted));
+      interrupted.resume = true; interrupted.stop_requested = {};
+      const auto bytes_before = std::filesystem::file_size(paused / "members.nma");
+      auto wrong = interrupted; wrong.tolerance = 4;
+      rejected([&] { ArchiveBuilder::extend(reference, input, paused, wrong); });
+      wrong.tolerance.reset();
+      rejected([&] { ArchiveBuilder::extend(reference, input, paused, wrong); });
+      assert(std::filesystem::file_size(paused / "members.nma") == bytes_before);
+      assert(ArchiveBuilder::extend(reference, input, paused, interrupted));
+      compare(ArchiveIndex::open(paused), expected);
+    }
+    auto invalid = config; invalid.tolerance = 2;
+    rejected([&] { ArchiveBuilder::extend(reference, output, run / "t-mismatch-new-archive", invalid); });
+    assert(!std::filesystem::exists(run / "t-mismatch-new-archive"));
+    invalid = config; invalid.world = 0;
+    rejected([&] { ArchiveBuilder::extend(reference, input, run / "t-mismatch-subtree", invalid); });
+    assert(!std::filesystem::exists(run / "t-mismatch-subtree"));
+  }
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
@@ -309,12 +396,24 @@ int main(int argc, char** argv) {
     const std::filesystem::path directory(argv[1]); std::filesystem::create_directories(directory);
     const auto run = directory / ("run-" + std::to_string(std::chrono::steady_clock::now().time_since_epoch().count()));
     std::filesystem::create_directory(run);
+    test_prefetch();
     std::vector<std::string> sequences{std::string(150, 'A'), std::string(80, 'A') + std::string(70, 'C'),
         std::string(150, 'C'), std::string(150, 'G'), std::string(150, 'T'), std::string(150, 'N'),
         std::string(149, 'A') + "C", std::string(149, 'N') + "A", std::string(150, 'A')};
     { std::ofstream out(directory / "small.fa"); for (std::size_t i = 0; i < sequences.size(); ++i) out << ">" << i << '\n' << sequences[i] << '\n'; }
     const auto small = SequenceStore::from_fasta(directory / "small.fa", 150);
     test_builds(directory / "legacy-small", run, small, false);
+    {
+      BuildConfig first; first.center_radii = {90};
+      const auto input = directory / "legacy-r90";
+      legacy_fixture(input, small, IndexBuilder::build(small, first), 90);
+      ArchiveBuildConfig next; next.radii = {85}; next.working_memory_mib = 16;
+      const auto output = run / "r90-r85";
+      assert(ArchiveBuilder::extend(small, input, output, next));
+      first.center_radii.push_back(85);
+      compare(ArchiveIndex::open(output), IndexBuilder::build(small, first));
+      test_changed_tolerance(input, run, small);
+    }
     test_varied(directory, run);
     { std::ofstream out(directory / "large.fa"); out << ">one\n" << std::string(65553 + 149, 'A') << "\n>two\n" << std::string(150, 'C') << "\n>three\n" << std::string(150, 'G') << '\n'; }
     const auto large = SequenceStore::from_fasta(directory / "large.fa", 150);

@@ -363,9 +363,9 @@ int command_archive_build(const Arguments& args) {
   if (args.get("--input").empty() || args.get("--output").empty() || !args.has("--radii")) {
     throw std::invalid_argument("extend-archive requires --input, --output and explicit --radii");
   }
-  if (args.has("--window") || args.has("--stride") || args.has("--limit") || args.has("--T") || args.has("--layers") ||
+  if (args.has("--window") || args.has("--stride") || args.has("--limit") || args.has("--layers") ||
       args.has("--beacon-ratios") || args.has("--beacon-cover-radii")) {
-    throw std::invalid_argument("archive reference parameters/T are inherited; archive routing does not use beacon tables");
+    throw std::invalid_argument("archive reference parameters are inherited; archive routing does not use beacon tables");
   }
   navigamer::ArchiveBuildConfig config;
   config.radii = values_list<std::uint32_t>(args.get("--radii"));
@@ -380,6 +380,11 @@ int command_archive_build(const Arguments& args) {
   config.threads = threads;
   config.working_memory_mib = unsigned_option("--memory-mib", 1024);
   config.checkpoint_members = unsigned_option("--checkpoint-members", 1000000);
+  if (args.has("--T")) {
+    const auto tolerances = values_list<std::uint32_t>(args.get("--T"));
+    if (tolerances.size() != 1) throw std::invalid_argument("--T requires one unsigned integer");
+    config.tolerance = tolerances[0];
+  }
   config.resume = args.has("--resume"); config.copy_input = args.has("--copy-input");
   if (args.has("--world")) {
     const auto ids = values_list<navigamer::NodeId>(args.get("--world"));
@@ -525,9 +530,10 @@ void usage() {
       " --radii R1,...,RN [--threads N] [--classifier beacon|adjacent]\n"
       "    Keep this world's center/members; replace its descendants in a new index.\n"
       "  extend-archive --reference ref.fa --input R75_DIRECTORY --output NEW_DIRECTORY"
-      " --radii R1,...,RN [--world ID] [--threads N] [--memory-mib 1024]"
+      " --radii R1,...,RN [--world ID] [--T NEW_T] [--threads N] [--memory-mib 1024]"
       " [--checkpoint-members 1000000] [--resume] [--copy-input]\n"
-      "    Legacy R75 world IDs are center ordinals; new archive world IDs are node IDs.\n"
+      "    --T NEW_T on a full legacy input reuses first-layer centers and rebuilds memberships/descendants.\n"
+      "    Legacy R75/R90 world IDs are center ordinals; new archive world IDs are node IDs.\n"
       "  inspect-archive --input ARCHIVE_DIRECTORY [--worlds]\n"
       "  query --reference ref.fa --index out.nvm --queries reads.fa"
       " [--tolerance T] [--route multilateration|scan] [--threads N]"

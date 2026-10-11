@@ -2,6 +2,7 @@
 #include "navigamer/center_selector.hpp"
 #include "navigamer/member_classifier.hpp"
 #include "archive_storage.hpp"
+#include "archive_prefetch.hpp"
 #include "build_parallel.hpp"
 
 #include <algorithm>
@@ -145,6 +146,7 @@ std::uint64_t input_binding(const std::filesystem::path& input, const ArchiveBui
   if (legacy) {
     for (const auto value : {legacy->fingerprint, legacy->windows, legacy->center_hash}) write(bytes, value);
   } else write_metadata(bytes, archive->metadata());
+  if (config.tolerance) write(bytes, std::uint64_t{*config.tolerance});
   const auto value = bytes.str();
   return hash({reinterpret_cast<const std::uint8_t*>(value.data()), value.size()});
 }
@@ -232,9 +234,10 @@ bool select_parent(const SequenceStore& reference, const std::filesystem::path& 
   const auto threads = parent.members.count < 4096 ? 1u : static_cast<std::uint32_t>(
       std::min<std::uint64_t>({config.threads, 1024, budget / (4 * 65536)}));
   CenterSelector selector(reference, job.metadata.radii.at(parent.depth), threads, job.centers, budget / 2);
+  MemberPrefetch batches([&] { return reader.next(65536); }, parent.members.count - job.selected_members > 65536);
   std::uint64_t since_checkpoint = 0;
   for (;;) {
-    const auto members = reader.next(65536);
+    const auto members = batches.next();
     if (members.empty()) break;
     selector.consume(members);
     job.selected_members += members.size(); since_checkpoint += members.size();
@@ -285,10 +288,13 @@ bool classify_parent(const SequenceStore& reference, const std::filesystem::path
   std::vector<std::unique_ptr<AdjacentClassifier>> classifiers;
   for (std::size_t i = 0; i < worker_count; ++i) classifiers.push_back(std::make_unique<AdjacentClassifier>(reference, job.centers, profiles, job.metadata.tolerance));
   detail::WorkerPool pool(worker_count);
+  // The fixed 8 MiB reader allowance includes both 512 KiB ID batches.
+  MemberPrefetch batches([&] { return reader.next(max_words * 64); },
+                         parent.members.count - job.classified_members > max_words * 64);
   std::uint64_t since_checkpoint = 0;
   std::vector<std::uint64_t> bits;
   for (;;) {
-    const auto members = reader.next(max_words * 64);
+    const auto members = batches.next();
     if (members.empty()) break;
     const auto words = (members.size() + 63) / 64;
     bits.assign(centers * words, 0);
@@ -331,7 +337,7 @@ ArchiveMetadata ArchiveBuilder::input_metadata(const std::filesystem::path& inpu
   ArchiveMetadata metadata;
   metadata.window = 150; metadata.stride = 1; metadata.tolerance = 5;
   metadata.reference_windows = legacy.windows; metadata.reference_fingerprint = legacy.fingerprint;
-  metadata.nodes = legacy.ids.size() + 1; metadata.radii = {75};
+  metadata.nodes = legacy.ids.size() + 1; metadata.radii = {legacy.radius};
   return metadata;
 }
 
@@ -356,6 +362,10 @@ bool ArchiveBuilder::extend(const SequenceStore& reference, const std::filesyste
     }
     if (config.world && *config.world >= legacy->ids.size()) throw std::out_of_range("R75 world ordinal out of range");
     (void)import_factor(*legacy, config, budget);
+  }
+  const bool reclassify = config.tolerance && *config.tolerance != (legacy ? 5 : prior->metadata().tolerance);
+  if (reclassify && (!legacy || config.world)) {
+    throw std::invalid_argument("changing archive T requires a full legacy R75/R90 input without --world; first-layer members and all descendants must be rebuilt");
   }
   const auto prefix_depth = config.world ? 0 : legacy ? 1 : prior->metadata().radii.size();
   if (prefix_depth + config.radii.size() > 255) throw std::invalid_argument("archive total depth exceeds 255");
@@ -400,19 +410,25 @@ bool ArchiveBuilder::extend(const SequenceStore& reference, const std::filesyste
     NodeTable nodes(output / "nodes.bin", reference.fingerprint(), true);
     ArchiveNode root;
     if (legacy) {
-      job.metadata.tolerance = 5; job.import_factor = import_factor(*legacy, config, budget);
+      job.metadata.tolerance = config.tolerance.value_or(5); job.import_factor = import_factor(*legacy, config, budget);
       if (config.world) {
         root.center = legacy->ids[*config.world]; root.members.source = 0;
-        job.metadata.root_radius = 75; job.metadata.nodes = 1;
+        job.metadata.root_radius = legacy->radius; job.metadata.nodes = 1;
         job.cursors.push_back({root.members, kNoSequence, {}});
       } else {
         root.members.count = reference.size(); root.child_count = legacy->ids.size(); root.first_child = 1;
-        job.metadata.radii = {75}; job.metadata.nodes = legacy->ids.size() + 1;
+        job.metadata.radii = {legacy->radius}; job.metadata.nodes = legacy->ids.size() + 1;
         for (std::size_t c = 0; c < legacy->ids.size(); ++c) {
           ArchiveNode node; node.center = legacy->ids[c]; node.parent = 0; node.depth = 1;
           node.members.source = 0; node.members.owner = c + 1;
           nodes.put(c + 1, node); job.cursors.push_back({node.members, kNoSequence, {}});
         }
+      }
+      if (reclassify) {
+        root.first_child = root.child_count = 0;
+        job.phase = Phase::kClassify; job.centers = legacy->ids;
+        job.child_first = 1; job.parent_before = root;
+        job.import_next = job.selected_members = reference.size();
       }
       nodes.put(0, root);
     } else {

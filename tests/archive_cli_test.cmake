@@ -43,7 +43,15 @@ if(NOT LAST_OUTPUT MATCHES "scope=world root_center_sequence_id=0" OR
    NOT LAST_OUTPUT MATCHES "layers=1" OR NOT LAST_OUTPUT MATCHES "radii=50")
   message(FATAL_ERROR "Existing descendants were not replaced: ${LAST_OUTPUT}")
 endif()
-foreach(invalid "--window;150" "--stride;1" "--limit;1" "--T;5" "--layers;1"
+run_cli(extend-archive --reference "${reference}" --input "${input}"
+  --output "${output}-t3" --T 3 --radii 90,90,90,90,90 --threads 4 --memory-mib 16)
+run_cli(inspect-archive --input "${output}-t3" --worlds)
+if(NOT LAST_OUTPUT MATCHES "T=3" OR NOT LAST_OUTPUT MATCHES "layers=6" OR
+   NOT LAST_OUTPUT MATCHES "radii=75,90,90,90,90,90")
+  message(FATAL_ERROR "Changed T was not applied: ${LAST_OUTPUT}")
+endif()
+foreach(invalid "--window;150" "--stride;1" "--limit;1" "--T;-1" "--T;3x" "--T;4294967296" "--layers;1"
+    "--T;3;--world;0"
     "--beacon-ratios;0.1" "--world;9999" "--world;-1" "--world;1,2"
     "--world;1x" "--memory-mib;0" "--memory-mib;-1" "--checkpoint-members;1x"
     "--threads;0" "--threads;1x")

@@ -261,13 +261,13 @@ LegacyCenters::LegacyCenters(const std::filesystem::path& directory, std::uint64
   fingerprint = read<std::uint64_t>(in); windows = read<std::uint64_t>(in);
   const auto next = read<std::uint64_t>(in), count = read<std::uint64_t>(in);
   center_hash = read<std::uint64_t>(in);
-  const auto radius = read<std::uint32_t>(in), tolerance = read<std::uint32_t>(in);
+  radius = read<std::uint32_t>(in); const auto tolerance = read<std::uint32_t>(in);
   const auto window = read<std::uint32_t>(in), stride = read<std::uint32_t>(in);
   (void)read<double>(in);
-  if (windows == 0 || next != windows || count == 0 || count > windows || radius != 75 ||
+  if (windows == 0 || next != windows || count == 0 || count > windows || (radius != 75 && radius != 90) ||
       tolerance != 5 || window != 150 || stride != 1 || count > 10000000 || count > memory_limit / 8 ||
       std::filesystem::file_size(directory / "checkpoint.bin") != 72 + count * 8) {
-    throw std::runtime_error("input must be a complete R75/T5/150/stride1 checkpoint");
+    throw std::runtime_error("input must be a complete R75/R90/T5/150/stride1 checkpoint");
   }
   ids.resize(count);
   in.read(reinterpret_cast<char*>(ids.data()), count * 8);
@@ -288,7 +288,7 @@ LegacyChunk read_legacy_chunk(const std::filesystem::path& directory, const Lega
   const auto raw = centers.ids.size() * words * 8;
   if (h[0] != 0x314b4e4843353752ULL || h[1] != 1 || h[2] != centers.fingerprint ||
       h[3] != centers.center_hash || h[4] != centers.windows || h[5] != centers.ids.size() ||
-      h[6] != first || h[7] != count || h[8] != 75 || h[9] != 5 || h[10] != 150 ||
+      h[6] != first || h[7] != count || h[8] != centers.radius || h[9] != 5 || h[10] != 150 ||
       h[11] != 1 || h[13] != raw || h[15] != 0 || h[14] > ZSTD_compressBound(raw) ||
       std::filesystem::file_size(path) != 128 + h[5] * 4 + h[14]) {
     throw std::runtime_error("R75 chunk metadata mismatch: " + path.string());
